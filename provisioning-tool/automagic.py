@@ -1528,7 +1528,7 @@ def ddwrt_do_cmd( tn, cmd, prompt, verbose = None ):
 def ddwrt_ssh_loopback( node, verbose = None ):
     # establish SSH loopback for the purpose of port forwarding
     tn = node[ 'conn' ]
-    cmd = 'ssh -L' + node['router']['address'] + ':8001:192.168.33.1:80 localhost\n'
+    cmd = 'ssh -y -L' + node['router']['address'] + ':8001:192.168.33.1:80 localhost\n'
     pw_prompt = 'password:'
     shell_prompt = 'root@'
     pw = node['router']['password'] + '\n'
@@ -1717,23 +1717,23 @@ def ddwrt_discover( cn, prefix ):
             ret.append( r )
     return ret
 
-def ddwrt_wget( cn, url, verbose, msg, tries = 1 ):
-    passes = 0
-    if msg:
-        sys.stdout.write( msg )
-    if verbose > 2:
-        print( url )
-    while True:
-        passes += 1
-        if msg:
-            sys.stdout.write( "." )
-            sys.stdout.flush( )
-        ( result, err ) = ddwrt_do_cmd( cn['conn'], "wget -T 1 -qO- '" + url + "'; echo", cn['eot'] )
-        if ( len(result) > 1 or result[0] != '' ) or passes > tries:
-            break
-        time.sleep( 2 )
-    if msg: print( )
-    return ( result, err )
+#def ddwrt_wget( cn, url, verbose, msg, tries = 1 ):
+#    passes = 0
+#    if msg:
+#        sys.stdout.write( msg )
+#    if verbose > 2:
+#        print( url )
+#    while True:
+#        passes += 1
+#        if msg:
+#            sys.stdout.write( "." )
+#            sys.stdout.flush( )
+#        ( result, err ) = ddwrt_do_cmd( cn['conn'], "wget -T 1 -qO- '" + url + "'; echo", cn['eot'] )
+#        if ( len(result) > 1 or result[0] != '' ) or passes > tries:
+#            break
+#        time.sleep( 2 )
+#    if msg: print( )
+#    return ( result, err )
 
 ####################################################################################
 #   Label interface
@@ -2713,6 +2713,35 @@ def check_status( ip_address, devname, ssid, rec, new_version, args ):
     print( "Could not find device on " + ssid + ' network' )
     return "Fail"
 
+def provision_device( addr, tries, args, ssid, pw, cfg ):
+    got_one = False
+    print( "Sending network credentials to device" )
+    for i in range(5):
+        time.sleep( args.pause_time )
+        # Load the URL multiple(?) times, even if we are successful the first time
+        for j in range(tries):
+            try:
+                if dev_gen == 2:
+                    if args.operation == 'provision-list' and 'StaticIP' in cfg:
+                        ( req, data ) = set_settings_post( addr, ssid, pw, cfg[ 'StaticIP'], cfg[ 'NetMask' ], cfg[ 'Gateway' ] )
+                    else:
+                        ( req, data ) = set_settings_post( addr, ssid, pw, None, None, None )
+                    content = json.loads( url_post( req, data ) )
+                else:
+                    if args.operation == 'provision-list' and 'StaticIP' in cfg:
+                        req = set_settings_url( addr, ssid, pw, cfg[ 'StaticIP'], cfg[ 'NetMask' ], cfg[ 'Gateway' ] )
+                    else:
+                        req = set_settings_url( addr, ssid, pw, None, None, None )
+
+                    content = json.loads( url_read( req ) )
+                if args.verbose > 2:
+                    print( repr( content ) )
+                got_one = True
+            except:
+                if not got_one: eprint( "Unexpected error [B]:", sys.exc_info( )[0] )
+        if got_one: return True
+    print( "Tried 15 times and could not instruct device to set up network" )
+    return False
 
 def provision_native( credentials, args, new_version ):
     global device_queue, device_db, dev_gen
@@ -2765,41 +2794,17 @@ def provision_native( credentials, args, new_version ):
             rec[ 'ConfigStatus' ][ 'factory_ssid' ] = found
             write_json_file( args.device_queue, device_queue )
 
-            got_one = False
             setup_count += 1
-            print( "Sending network credentials to device" )
-            for i in range(5):
-                time.sleep( args.pause_time )
-                # Load the URL three times, even if we are successful the first time
-                for j in range(3):
-                    try:
-                        if dev_gen == 2:
-                            if args.operation == 'provision-list' and 'StaticIP' in cfg:
-                                ( req, data ) = set_settings_post( factory_device_addr, ssid, pw, cfg[ 'StaticIP'], cfg[ 'NetMask' ], cfg[ 'Gateway' ] )
-                            else:
-                                ( req, data ) = set_settings_post( factory_device_addr, ssid, pw, None, None, None )
-                            content = json.loads( url_post( req, data ) )
-                        else:
-                            if args.operation == 'provision-list' and 'StaticIP' in cfg:
-                                req = set_settings_url( factory_device_addr, ssid, pw, cfg[ 'StaticIP'], cfg[ 'NetMask' ], cfg[ 'Gateway' ] )
-                            else:
-                                req = set_settings_url( factory_device_addr, ssid, pw, None, None, None )
-
-                            content = json.loads( url_read( req ) )
-                        if args.verbose > 2:
-                            print( repr( content ) )
-                        got_one = True
-                    except:
-                        if not got_one: eprint( "Unexpected error [B]:", sys.exc_info( )[0] )
-                if got_one: break
-            if not got_one:
-                print( "Tried 15 times and could not instruct device to set up network" )
-                sys.exit( )
+            stat = provision_device( factory_device_addr, 3, args, ssid, pw, cfg )
 
             ### Connect (back) to main network
             if not wifi_reconnect( credentials ):
                 print( "Could not reconnect to " + ssid )
                 break
+
+            if not stat:
+                sys.exit(0)
+
             rec[ 'ConfigStatus' ][ 'CompletedTime' ] = time.time()
             success_count += 1
             if args.operation != 'config-test':
@@ -2866,31 +2871,44 @@ def provision_ddwrt( args, new_version ):
                     t1 = timeit.default_timer()
                     ddwrt_ssh_loopback( sta_node )
                     if args.timing: print( 'setting ssh loopback time: ', round( timeit.default_timer() - t1, 2 ) )
+                    forwarded_addr = sta_node['router']['address'] + ':8001'
 
                     t1 = timeit.default_timer()
-                    ( response, err ) = ddwrt_wget( sta_node, status_url( factory_device_addr ), args.verbose, None, 10 )
-                    if args.timing: print( 'initial status time: ', round( timeit.default_timer() - t1, 2 ) )
-                    if response[0] == '':
-                        print( err )
-                        print( "Timed out waiting for connection to device in AP mode" )
+                    if not get_status( forwarded_addr, args.pause_time, args.verbose ):
+                        print( "Failed to contact device after connecting to its AP" )
+                        time.sleep(600)
                         sys.exit( )
-                    initial_status = json.loads( response[0] )
+
+                    #( response, err ) = ddwrt_wget( sta_node, status_url( factory_device_addr ), args.verbose, None, 10 )
+                    #if args.timing: print( 'initial status time: ', round( timeit.default_timer() - t1, 2 ) )
+                    #if response[0] == '':
+                    #    print( err )
+                    #    print( "Timed out waiting for connection to device in AP mode" )
+                    #    sys.exit( )
+                    #initial_status = json.loads( response[0] )
 
                     t1 = timeit.default_timer()
-                    print( "Sending network settings to target IoT device" )
-                    for i in range(5):
-                        if 'StaticIP' in cfg:
-                            url = set_settings_url( factory_device_addr, cfg[ 'SSID' ], cfg[ 'Password' ], cfg[ 'StaticIP'], cfg[ 'NetMask' ], cfg[ 'Gateway' ] )
-                        else:
-                            url = set_settings_url( factory_device_addr, cfg[ 'SSID' ], cfg[ 'Password' ], None, None, None )
-                        ( result, err ) = ddwrt_wget( sta_node, url, args.verbose, None, 5 )
-                        if args.verbose: print( repr( [ result, err ] ) )
-                        if args.timing: print( 'settings time: ', round( timeit.default_timer() - t1, 2 ) )
-                        if result[0] != '': 
-                            print( repr( [ result, err ] ) )
-                            tmp = json.loads( result[0] )
-                            if tmp['ssid'] == cfg[ 'SSID' ]: break
-                    if tmp['ssid'] == cfg[ 'SSID' ]: break
+                    # try just once if using a single DDWRT device, because of timing... need to reconfigure quickly
+                    tries = 1 if ap_node[ 'router' ][ 'et0macaddr' ] == sta_node[ 'router' ][ 'et0macaddr' ] else 3
+                    stat = provision_device( forwarded_addr, tries, args, cfg[ 'SSID' ], cfg[ 'Password' ], cfg )
+                    if args.timing: print( 'settings time: ', round( timeit.default_timer() - t1, 2 ) )
+                    if stat: break
+                    
+
+                    #print( "Sending network settings to target IoT device" )
+                    #for i in range(5):
+                    #    if 'StaticIP' in cfg:
+                    #        url = set_settings_url( factory_device_addr, cfg[ 'SSID' ], cfg[ 'Password' ], cfg[ 'StaticIP'], cfg[ 'NetMask' ], cfg[ 'Gateway' ] )
+                    #    else:
+                    #        url = set_settings_url( factory_device_addr, cfg[ 'SSID' ], cfg[ 'Password' ], None, None, None )
+                    #    ( result, err ) = ddwrt_wget( sta_node, url, args.verbose, None, 5 )
+                    #    if args.verbose: print( repr( [ result, err ] ) )
+                    #    if args.timing: print( 'settings time: ', round( timeit.default_timer() - t1, 2 ) )
+                    #    if result[0] != '': 
+                    #        print( repr( [ result, err ] ) )
+                    #        tmp = json.loads( result[0] )
+                    #        if tmp['ssid'] == cfg[ 'SSID' ]: break
+                    #if tmp['ssid'] == cfg[ 'SSID' ]: break
 
                     if attempts >= 10:
                         print( "Device failed to take AP provisioning instructions after 10 attempts." )
@@ -2911,6 +2929,7 @@ def provision_ddwrt( args, new_version ):
                 else:
                     ip_address = device_ssids[ 0 ]
 
+                print( "Attempting to connect to device on " + cfg['SSID'] )
                 new_status = check_status( ip_address, device_ssids[ 0 ], cfg['SSID'], rec, new_version, args )
                 if new_status == 'Quit': return False
                 if new_status == 'Fail':
