@@ -150,7 +150,7 @@ default_query_columns = [ 'type', 'Origin', 'IP', 'ID', 'fw', 'has_update', 'set
 
 all_operations = ( 'help', 'features', 'provision', 'provision-list', 'factory-reset', 'flash', 'import', 'list', 'clear-list', 
                    'ddwrt-learn', 'print-sample', 'probe-list', 'query', 'schema', 'apply', 'identify', 'replace', 'list-versions',
-                   'acceptance-test', 'config-test', 'idle' )
+                   'acceptance-test', 'config-test' )
 
 exclude_setting = [ 'unixtime', 'fw', 'time', 'hwinfo', 'build_info', 'device', 'ison', 'has_timer', 'power', 'connected',
         'ext_humidity','ext_switch','ext_sensors','ext_temperature',    #TODO  -- parameter
@@ -2823,14 +2823,6 @@ def provision_native( credentials, args, new_version ):
                 print( 'Found no new devices. Waiting ' + str(args.wait_time) + ' seconds before looking again. Press ^C to cancel' )
             time.sleep( args.wait_time )
 
-def idle( args, new_version, verbose ):
-    global device_queue, device_db
-    t1 = timeit.default_timer()
-    ( ap_node, sta_node ) = ddwrt_choose_roles( args.ddwrt_name )
-    ddwrt_ssh_loopback( sta_node, verbose )
-    print( "idling" )
-    time.sleep(100)
-
 def provision_ddwrt( args, new_version ):
     global device_queue, device_db, dev_gen
     t1 = timeit.default_timer()
@@ -2900,32 +2892,6 @@ def provision_ddwrt( args, new_version ):
                             if tmp['ssid'] == cfg[ 'SSID' ]: break
                     if tmp['ssid'] == cfg[ 'SSID' ]: break
 
-                    #### Added check for SSID above, replacing this wait for WiFi survey to drop.
-                    #### With a single DD-WRT device, this additional pause meant less reliable behavior because of
-                    #### the delay in setting up the ap mode. Sometimes the Shelly would revert to factory reset.
-
-                    # wait for site_survey to drop the device
-                    #passes = 0
-                    #misses = 0
-                    #sys.stdout.write( "Waiting for device SSID to drop from WiFi survey" )
-                    #t1 = timeit.default_timer()
-                    #while misses < 3 and passes < 60:
-                    #    time.sleep( 1 )
-                    #    passes += 1
-                    #    check_ssids = ddwrt_discover( ap_node, args.prefix )
-                    #    if device_ssids[ 0 ] in check_ssids:
-                    #        misses = 0
-                    #        sys.stdout.write( "." )
-                    #    else:
-                    #        misses += 1
-                    #        sys.stdout.write( "+" )
-                    #    sys.stdout.flush()
-                    #if args.timing: print( 'WiFi drop wait time: ', round( timeit.default_timer() - t1, 2 ) )
-
-                    #print( "" )
-                    #if misses >= 3: 
-                    #    break
-
                     if attempts >= 10:
                         print( "Device failed to take AP provisioning instructions after 10 attempts." )
                         sys.exit( )
@@ -2945,14 +2911,6 @@ def provision_ddwrt( args, new_version ):
                 else:
                     ip_address = device_ssids[ 0 ]
 
-                #msg = "Finding " + ip_address + " on new network"
-                #( response, err ) = ddwrt_wget( ap_node, get_settings_url( ip_address, cfg ), args.verbose, msg, 40 )
-                #if response[0] == '':
-                #    print( err )
-                #    print( "Timed out waiting for connection to connect to WiFi" )
-                #    sys.exit( )
-                #configured_settings = json.loads(response[0])
-
                 new_status = check_status( ip_address, device_ssids[ 0 ], cfg['SSID'], rec, new_version, args )
                 if new_status == 'Quit': return False
                 if new_status == 'Fail':
@@ -2960,10 +2918,6 @@ def provision_ddwrt( args, new_version ):
                     sys.exit()
 
                 if args.timing: print( 'WiFi transition time:', round( timeit.default_timer() - t1, 2 ) )
-
-                #if configured_settings == '':
-                #    print( "Failed to find device on network" )
-                #    sys.exit()
 
                 success_count += 1
                 rec[ 'ConfigStatus' ][ 'CompletedTime' ] = time.time()
@@ -3149,7 +3103,6 @@ def validate_options( p, vars ):
               "probe-list" : [ "query_conditions", "group", "refresh", "access" ],
               "provision-list" : [ "group", "ddwrt_name", "group", "cue", "timing", "ota", "print_using", "toggle", "wait_time", "settings" ],
               "provision" : [ "ssid", "wait_time", "ota", "print_using", "toggle", "cue", "settings" ],
-              "idle" : [ "ddwrt_name" ],
               "acceptance-test" : [ "ssid" ],
               "config-test" : [ "ssid" ],
               "list" : [ "group" ],
@@ -3377,9 +3330,6 @@ def main():
 
     elif args.operation == 'provision-list':
         provision_ddwrt( args, new_version )
-
-    elif args.operation == 'idle':
-        idle( args, new_version, args.verbose )
 
     elif args.operation == 'list':
         print_list( args.device_queue, args.group )
