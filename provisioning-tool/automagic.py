@@ -1717,24 +1717,6 @@ def ddwrt_discover( cn, prefix ):
             ret.append( r )
     return ret
 
-#def ddwrt_wget( cn, url, verbose, msg, tries = 1 ):
-#    passes = 0
-#    if msg:
-#        sys.stdout.write( msg )
-#    if verbose > 2:
-#        print( url )
-#    while True:
-#        passes += 1
-#        if msg:
-#            sys.stdout.write( "." )
-#            sys.stdout.flush( )
-#        ( result, err ) = ddwrt_do_cmd( cn['conn'], "wget -T 1 -qO- '" + url + "'; echo", cn['eot'] )
-#        if ( len(result) > 1 or result[0] != '' ) or passes > tries:
-#            break
-#        time.sleep( 2 )
-#    if msg: print( )
-#    return ( result, err )
-
 ####################################################################################
 #   Label interface
 ####################################################################################
@@ -2879,14 +2861,6 @@ def provision_ddwrt( args, new_version ):
                         time.sleep(600)
                         sys.exit( )
 
-                    #( response, err ) = ddwrt_wget( sta_node, status_url( factory_device_addr ), args.verbose, None, 10 )
-                    #if args.timing: print( 'initial status time: ', round( timeit.default_timer() - t1, 2 ) )
-                    #if response[0] == '':
-                    #    print( err )
-                    #    print( "Timed out waiting for connection to device in AP mode" )
-                    #    sys.exit( )
-                    #initial_status = json.loads( response[0] )
-
                     t1 = timeit.default_timer()
                     # try just once if using a single DDWRT device, because of timing... need to reconfigure quickly
                     tries = 1 if ap_node[ 'router' ][ 'et0macaddr' ] == sta_node[ 'router' ][ 'et0macaddr' ] else 3
@@ -2894,22 +2868,6 @@ def provision_ddwrt( args, new_version ):
                     if args.timing: print( 'settings time: ', round( timeit.default_timer() - t1, 2 ) )
                     if stat: break
                     
-
-                    #print( "Sending network settings to target IoT device" )
-                    #for i in range(5):
-                    #    if 'StaticIP' in cfg:
-                    #        url = set_settings_url( factory_device_addr, cfg[ 'SSID' ], cfg[ 'Password' ], cfg[ 'StaticIP'], cfg[ 'NetMask' ], cfg[ 'Gateway' ] )
-                    #    else:
-                    #        url = set_settings_url( factory_device_addr, cfg[ 'SSID' ], cfg[ 'Password' ], None, None, None )
-                    #    ( result, err ) = ddwrt_wget( sta_node, url, args.verbose, None, 5 )
-                    #    if args.verbose: print( repr( [ result, err ] ) )
-                    #    if args.timing: print( 'settings time: ', round( timeit.default_timer() - t1, 2 ) )
-                    #    if result[0] != '': 
-                    #        print( repr( [ result, err ] ) )
-                    #        tmp = json.loads( result[0] )
-                    #        if tmp['ssid'] == cfg[ 'SSID' ]: break
-                    #if tmp['ssid'] == cfg[ 'SSID' ]: break
-
                     if attempts >= 10:
                         print( "Device failed to take AP provisioning instructions after 10 attempts." )
                         sys.exit( )
