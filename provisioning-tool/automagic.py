@@ -170,7 +170,7 @@ wifi_reconnect = None
 urlquote = None
 deep_update = None
 url_read = None
-url_post = None
+rpc_post = None
 http_post = None
 os_stash = {}
 stringtofile = None
@@ -1285,16 +1285,18 @@ def v2_url_read( s, mode = 't', tmout = 2 ):
         return urllib2.urlopen( s, timeout = tmout ).read( )
     return urllib2.urlopen( s, timeout = tmout ).read( ).decode( 'utf8' )
 
-def v2_url_post( s, data, mode = 't', tmout = 2 ):
-    print( "TBD" )
-    sys.exit(0)
+def v2_rpc_post( s, data, mode = 't', tmout = 2 ):
+    response = urllib2.urlopen( urllib2.Request( s, data ), timeout = tmout )
+    if mode == 'b':
+        return response.read()
+    return response.read().decode( 'utf8' )
 
 def v3_url_read( s, mode = 't', tmout = 2 ):
     return urllib.request.urlopen( s, timeout = tmout ).read( )
 
-def v3_url_post( s, data, mode = 't', tmout = 2 ):
-    print( "TBD" )
-    sys.exit(0)
+def v3_rpc_post( s, data, mode = 't', tmout = 2 ):
+    #TODO-KBC - timeout?
+    return( requests.post( s, data = data, headers={'Content-Type': 'application/x-www-form-urlencoded'} ).text )
 
 def v2_http_post( url, data, username, password, referrer ):
     post = url_encode( data )
@@ -1328,18 +1330,18 @@ def noop( a = "" ):
     return( a )
 
 def compatibility( ):
-    global url_read, url_post, http_post, urlquote, stringtofile, deep_update
+    global url_read, rpc_post, http_post, urlquote, stringtofile, deep_update
 
     if sys.version_info.major >= 3:
         url_read = v3_url_read
-        url_post = v3_url_post
+        rpc_post = v3_rpc_post
         http_post = v3_http_post
         deep_update = v3_deep_update
         urlquote = urllib.parse.quote
         stringtofile = BytesIO
     else:
         url_read = v2_url_read
-        url_post = v2_url_post
+        rpc_post = v2_rpc_post
         http_post = v2_http_post
         deep_update = v2_deep_update
         urlquote = urllib.quote_plus
@@ -1505,7 +1507,7 @@ def mac_wifi_reconnect( credentials ):
 #   DD-WRT interactions
 ####################################################################################
 
-def ddwrt_do_cmd( tn, cmd, prompt, verbose = None ):
+def ddwrt_do_cmd( tn, cmd, prompt, verbose = 0 ):
     if verbose: print( cmd )
     dbg = tn.read_very_eager() # throw away any pending junk
     if verbose > 2: print( dbg )
@@ -1525,7 +1527,7 @@ def ddwrt_do_cmd( tn, cmd, prompt, verbose = None ):
     if verbose > 2: print( err )
     return ( result, err )
 
-def ddwrt_ssh_loopback( node, verbose = None ):
+def ddwrt_ssh_loopback( node, verbose = 0 ):
     # establish SSH loopback for the purpose of port forwarding
     tn = node[ 'conn' ]
     cmd = 'ssh -y -L' + node['router']['address'] + ':8001:192.168.33.1:80 localhost\n'
@@ -1835,7 +1837,8 @@ def get_url( addr, tm, verbose, url, operation, tmout = 2 ):
             raw_data = url_read( url, tmout = tmout )
             contents = json.loads( raw_data )
         except HTTPError as e:
-            print('in get_url, Error code:', e.code)
+            print('in get_url, reading: ', url)
+            print('Error code:', e.code)
             print( e.read( ) )
         except BaseException as e:
             if any_timeout_reason( e ):
@@ -1853,7 +1856,7 @@ def get_url( addr, tm, verbose, url, operation, tmout = 2 ):
     if raw_data: print( "Raw results from last attempt: " + raw_data )
     return None
 
-def set_settings_url( address, ssid, pw, static_ip, ip_mask, gateway ):
+def set_settings_get( address, ssid, pw, static_ip, ip_mask, gateway ):
     if static_ip:
         gw = ( "&gateway=" + gateway ) if gateway else ''
         return "http://" + address + "/settings/sta/?enabled=1&ssid=" + urlquote(ssid) + "&key=" + urlquote(pw) + "&ipv4_method=static&ip=" + static_ip + "&netmask=" + ip_mask + gw
@@ -1861,9 +1864,12 @@ def set_settings_url( address, ssid, pw, static_ip, ip_mask, gateway ):
         return "http://" + address + "/settings/sta/?enabled=1&ssid=" + urlquote(ssid) + "&key=" + urlquote(pw) + "&ipv4_method=dhcp"
 
 def set_settings_post( address, ssid, pw, static_ip, ip_mask, gateway ):
-    ### TBD -- if static_ip:
-    return ( 'http://' + factory_device_addr + '/rpc', 
-             '{"id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta1":{"ssid":"' + ssid + '", "pass":"' + pw + '"}}}}' )
+    if static_ip:
+        print( "Support of static IP TBD" )
+        sys.exit( 0 )
+
+    return ( 'http://' + address + '/rpc', 
+             '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta1":{"ssid":"' + ssid + '", "pass":"' + pw + '", "enable": true}}}}' )
 
 ####################################################################################
 #   JSON Utilities
@@ -1914,16 +1920,23 @@ def status_url( address ):
     else:
         return "http://" + address + "/status"
 
+def wifi_status_url( address ):
+    return "http://" + address + "/rpc/Wifi.GetStatus"
+
 def get_settings_url( address, rec = None ):
-    map = { "DeviceName" : "name", "LatLng" : "lat:lng", "TZ" : "tz_dst:tz_dst_auto:tz_utc_offset:tzautodetect" }
-    parms = {}
-    if rec:
-         for tag in map:
-             if tag in rec:
-                 for elem in zip( map[ tag ].split(':'), rec[ tag ].split(':') ):
-                     parms[ elem[ 0 ]  ] = elem[ 1 ]
-    q = "?" + url_encode( parms ) if parms else ""
-    return "http://" + address + "/settings" + q
+    if dev_gen == 2:
+         #TODO-KBC - dst stuff?
+         return "http://" + address + "/rpc/Sys.GetConfig"
+    else:
+         map = { "DeviceName" : "name", "LatLng" : "lat:lng", "TZ" : "tz_dst:tz_dst_auto:tz_utc_offset:tzautodetect" }
+         parms = {}
+         if rec:
+              for tag in map:
+                  if tag in rec:
+                      for elem in zip( map[ tag ].split(':'), rec[ tag ].split(':') ):
+                          parms[ elem[ 0 ]  ] = elem[ 1 ]
+         q = "?" + url_encode( parms ) if parms else ""
+         return "http://" + address + "/settings" + q
 
 def ota_url( addr, fw ):
     if fw == 'LATEST':
@@ -1932,6 +1945,10 @@ def ota_url( addr, fw ):
 
 def get_status( addr, tm, verbose ):
     url = status_url( addr )
+    return get_url( addr, tm, verbose, url, 'to confirm status' )
+
+def get_wifi_status( addr, tm, verbose ):
+    url = wifi_status_url( addr )
     return get_url( addr, tm, verbose, url, 'to confirm status' )
 
 def get_actions( addr, tm, verbose ):
@@ -2101,7 +2118,7 @@ def import_csv( file, queue_file ):
        append_list( reader )
     write_json_file( queue_file, device_queue )
 
-def finish_up_device( device, rec, operation, args, new_version, initial_status, configured_settings = None ):
+def finish_up_device( device, rec, operation, args, new_version, initial_status, configured_settings, wifi_status ):
     global device_db
     rec[ 'ConfigStatus' ][ 'ConfirmedTime' ] = time.time()
     #need_update = False
@@ -2115,7 +2132,12 @@ def finish_up_device( device, rec, operation, args, new_version, initial_status,
     rec[ 'ConfigStatus' ][ 'Origin' ] = operation
     rec[ 'Brand' ] = 'Shelly'
     rec[ 'ID' ] = initial_status[ 'mac' ]
-    rec[ 'IP' ] = initial_status[ 'wifi_sta' ][ 'ip' ]
+
+    print( repr( initial_status ) )
+    if wifi_status:
+        rec[ 'IP' ] = wifi_status[ 'sta_ip' ]
+    else:
+        rec[ 'IP' ] = initial_status[ 'wifi_sta' ][ 'ip' ]
 
     rec = copy.deepcopy( rec )
     if not configured_settings: configured_settings = get_url( device, args.pause_time, args.verbose, get_settings_url( device, rec['ConfigInput'] ), 'to get config' )
@@ -2675,6 +2697,7 @@ def acceptance_test( args, credentials ):
 
 def check_status( ip_address, devname, ssid, rec, new_version, args ):
     initial_status = get_status( ip_address, args.pause_time, args.verbose )
+    wifi_status = None
 
     if initial_status:
         print( "Confirmed device " + devname + " on " + ssid + ' network' )
@@ -2690,7 +2713,9 @@ def check_status( ip_address, devname, ssid, rec, new_version, args ):
                 return 'Quit'
             return initial_status
         else:
-            finish_up_device( ip_address, rec, args.operation, args, new_version, initial_status )
+            if dev_gen == 2:
+                wifi_status = get_wifi_status( ip_address, args.pause_time, args.verbose )
+            finish_up_device( ip_address, rec, args.operation, args, new_version, initial_status, None, wifi_status )
             return initial_status
     print( "Could not find device on " + ssid + ' network' )
     return "Fail"
@@ -2698,29 +2723,29 @@ def check_status( ip_address, devname, ssid, rec, new_version, args ):
 def provision_device( addr, tries, args, ssid, pw, cfg ):
     got_one = False
     print( "Sending network credentials to device" )
+    static_ip = cfg[ 'StaticIP' ] if 'StaticIP' in cfg and args.operation == 'provision-list' else None
+    netmask = cfg[ 'NetMask' ] if 'StaticIP' in cfg and args.operation == 'provision-list' else None
+    gateway = cfg[ 'Gateway' ] if 'StaticIP' in cfg and args.operation == 'provision-list' else None
+
     for i in range(5):
         time.sleep( args.pause_time )
         # Load the URL multiple(?) times, even if we are successful the first time
         for j in range(tries):
-            try:
+            #try:
                 if dev_gen == 2:
-                    if args.operation == 'provision-list' and 'StaticIP' in cfg:
-                        ( req, data ) = set_settings_post( addr, ssid, pw, cfg[ 'StaticIP'], cfg[ 'NetMask' ], cfg[ 'Gateway' ] )
-                    else:
-                        ( req, data ) = set_settings_post( addr, ssid, pw, None, None, None )
-                    content = json.loads( url_post( req, data ) )
+                    ( req, data ) = set_settings_post( addr, ssid, pw, static_ip, netmask, gateway )
+                    res = rpc_post( req, data )
+                    print( repr( res ) )
+                    content = json.loads( res )
                 else:
-                    if args.operation == 'provision-list' and 'StaticIP' in cfg:
-                        req = set_settings_url( addr, ssid, pw, cfg[ 'StaticIP'], cfg[ 'NetMask' ], cfg[ 'Gateway' ] )
-                    else:
-                        req = set_settings_url( addr, ssid, pw, None, None, None )
-
+                    req = set_settings_get( addr, ssid, pw, static_ip, netmask, gateway )
                     content = json.loads( url_read( req ) )
                 if args.verbose > 2:
+                    print( repr( [req, data] ) )
                     print( repr( content ) )
                 got_one = True
-            except:
-                if not got_one: eprint( "Unexpected error [B]:", sys.exc_info( )[0] )
+            #except:
+            #    if not got_one: eprint( "Unexpected error [B]:", sys.exc_info( )[0] )
         if got_one: return True
     print( "Tried 15 times and could not instruct device to set up network" )
     return False
@@ -2903,7 +2928,10 @@ def provision_ddwrt( args, new_version ):
                 if args.verbose > 2: print( repr( new_status ) )
                 print( )
 
-                finish_up_device( ip_address, rec, args.operation, args, new_version, new_status )
+                wifi_status = None
+                if dev_gen == 2:
+                    wifi_status = get_wifi_status( ip_address, args.pause_time, args.verbose )
+                finish_up_device( ip_address, rec, args.operation, args, new_version, new_status, None, wifi_status )
 
                 break
             else:
