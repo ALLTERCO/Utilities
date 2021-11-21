@@ -2150,6 +2150,7 @@ def finish_up_device( device, rec, operation, args, new_version, initial_status,
     rec = copy.deepcopy( rec )
     if not configured_settings: configured_settings = get_url( device, args.pause_time, args.verbose, get_settings_url( device, rec['ConfigInput'] ), 'to get config' )
     rec[ 'status' ] = initial_status
+    if configured_settings and 'type' not in configured_settings[ 'device' ]: configured_settings[ 'device' ][ 'type' ] = rec[ 'ConfigStatus' ][ 'factory_ssid' ].split('-')[0]
     rec[ 'settings' ] = configured_settings if configured_settings else {}
 
     device_db[ initial_status[ 'mac' ] ] = rec
@@ -2760,21 +2761,21 @@ def provision_device( addr, tries, args, ssid, pw, cfg ):
     print( "Tried 15 times and could not instruct device to set up network" )
     return False
 
-def gen2_rpc( args, txn ):
+def gen2_rpc( verbosity, txn ):
     ( req, data ) = txn
     res = rpc_post( req, data )
     content = json.loads( res )
-    if args.verbose > 2:
+    if verbosity > 2:
         print( repr( [req, data] ) )
         print( repr( content ) )
 
 def disable_ap_mode( args, addr ):
     if dev_gen == 2:
-        gen2_rpc( args, disable_ap_post( addr ) )
+        gen2_rpc( args.verbose, disable_ap_post( addr ) )
 
 def disable_BLE( args, addr ):
     if dev_gen == 2:
-        gen2_rpc( args, disable_BLE_post( addr ) )
+        gen2_rpc( args.verbose, disable_BLE_post( addr ) )
 
 def provision_native( credentials, args, new_version ):
     global device_queue, device_db, dev_gen
