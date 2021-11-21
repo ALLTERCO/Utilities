@@ -791,7 +791,7 @@ def example_provision_2():
                  def make_label( dev_info ):
                      print( repr( dev_info ) )
 
-             See also: "help print sample"
+             See also: "help print-sample"
           """ )
 
 def example_provision_3():
@@ -1856,20 +1856,28 @@ def get_url( addr, tm, verbose, url, operation, tmout = 2 ):
     if raw_data: print( "Raw results from last attempt: " + raw_data )
     return None
 
-def set_settings_get( address, ssid, pw, static_ip, ip_mask, gateway ):
+def set_wifi_get( address, ssid, pw, static_ip, ip_mask, gateway ):
     if static_ip:
         gw = ( "&gateway=" + gateway ) if gateway else ''
         return "http://" + address + "/settings/sta/?enabled=1&ssid=" + urlquote(ssid) + "&key=" + urlquote(pw) + "&ipv4_method=static&ip=" + static_ip + "&netmask=" + ip_mask + gw
     else:
         return "http://" + address + "/settings/sta/?enabled=1&ssid=" + urlquote(ssid) + "&key=" + urlquote(pw) + "&ipv4_method=dhcp"
 
-def set_settings_post( address, ssid, pw, static_ip, ip_mask, gateway ):
+def set_wifi_post( address, ssid, pw, static_ip, ip_mask, gateway ):
     if static_ip:
         print( "Support of static IP TBD" )
         sys.exit( 0 )
 
     return ( 'http://' + address + '/rpc', 
              '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta1":{"ssid":"' + ssid + '", "pass":"' + pw + '", "enable": true}}}}' )
+
+def disable_ap_post( address ):
+    return ( 'http://' + address + '/rpc', 
+             '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"ap":{"enable": false}}}}' )
+
+def disable_BLE_post( address ):
+    return ( 'http://' + address + '/rpc', 
+             '{ "id":1, "src":"user_1", "method":"BLE.SetConfig", "params":{"config":{"enable": false}}}' )
 
 ####################################################################################
 #   JSON Utilities
@@ -2151,6 +2159,9 @@ def finish_up_device( device, rec, operation, args, new_version, initial_status,
     #    new_settings = get_url( device, args.pause_time, args.verbose, get_settings_url( device, rec ), 'to set device name' )
     #    need_update = True
     #    rec['settings'] = new_settings
+
+    disable_ap_mode( args, rec[ 'IP' ] )
+    disable_BLE( args, rec[ 'IP' ] )
 
     if args.ota != '':
         if flash_device( device, args.pause_time, args.verbose, args.ota, args.ota_timeout, new_version, args.dry_run ):
@@ -2731,24 +2742,39 @@ def provision_device( addr, tries, args, ssid, pw, cfg ):
         time.sleep( args.pause_time )
         # Load the URL multiple(?) times, even if we are successful the first time
         for j in range(tries):
-            #try:
+            try:
                 if dev_gen == 2:
-                    ( req, data ) = set_settings_post( addr, ssid, pw, static_ip, netmask, gateway )
+                    ( req, data ) = set_wifi_post( addr, ssid, pw, static_ip, netmask, gateway )
                     res = rpc_post( req, data )
-                    print( repr( res ) )
                     content = json.loads( res )
                 else:
-                    req = set_settings_get( addr, ssid, pw, static_ip, netmask, gateway )
+                    req = set_wifi_get( addr, ssid, pw, static_ip, netmask, gateway )
                     content = json.loads( url_read( req ) )
                 if args.verbose > 2:
                     print( repr( [req, data] ) )
                     print( repr( content ) )
                 got_one = True
-            #except:
-            #    if not got_one: eprint( "Unexpected error [B]:", sys.exc_info( )[0] )
+            except:
+                if not got_one: eprint( "Unexpected error [B]:", sys.exc_info( )[0] )
         if got_one: return True
     print( "Tried 15 times and could not instruct device to set up network" )
     return False
+
+def gen2_rpc( args, txn ):
+    ( req, data ) = txn
+    res = rpc_post( req, data )
+    content = json.loads( res )
+    if args.verbose > 2:
+        print( repr( [req, data] ) )
+        print( repr( content ) )
+
+def disable_ap_mode( args, addr ):
+    if dev_gen == 2:
+        gen2_rpc( args, disable_ap_post( addr ) )
+
+def disable_BLE( args, addr ):
+    if dev_gen == 2:
+        gen2_rpc( args, disable_BLE_post( addr ) )
 
 def provision_native( credentials, args, new_version ):
     global device_queue, device_db, dev_gen
@@ -2827,6 +2853,7 @@ def provision_native( credentials, args, new_version ):
             if stat == 'Quit': return false
             if stat == 'Fail': break
 
+            disable_ap_mode( args, ip_address )
         else:
             if args.wait_time == 0:
                 print("Exiting. No additional devices found and time-to-wait is 0. Set non-zero time-to-wait to poll for multiple devices.")
@@ -2928,10 +2955,11 @@ def provision_ddwrt( args, new_version ):
                 if args.verbose > 2: print( repr( new_status ) )
                 print( )
 
-                wifi_status = None
-                if dev_gen == 2:
-                    wifi_status = get_wifi_status( ip_address, args.pause_time, args.verbose )
-                finish_up_device( ip_address, rec, args.operation, args, new_version, new_status, None, wifi_status )
+                ### this moved to check_status()
+                ##wifi_status = None
+                ##if dev_gen == 2:
+                ##    wifi_status = get_wifi_status( ip_address, args.pause_time, args.verbose )
+                ##finish_up_device( ip_address, rec, args.operation, args, new_version, new_status, None, wifi_status )
 
                 break
             else:
