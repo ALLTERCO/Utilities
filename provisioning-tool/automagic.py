@@ -1611,7 +1611,7 @@ def ddwrt_program_mode( cn, pgm, from_db, deletes=None ):
     else:
         cn[ 'current_mode' ] = mode
         ddwrt_apply( cn[ 'router' ][ 'address' ], 'admin', cn[ 'router' ][ 'password' ] )
-        print( "changing dd-wrt modes... configuration sent, now waiting for dd-wrt to apply changes" )
+        print( "changing dd-wrt mode to " + mode + "... configuration sent, now waiting for dd-wrt to apply changes" )
         time.sleep( 5 )
         ddwrt_sync_connection( cn, b'', 20 )
         ddwrt_get_single_line_result( cn, "wl radio off; wl radio on" )
@@ -1865,11 +1865,13 @@ def set_wifi_get( address, ssid, pw, static_ip, ip_mask, gateway ):
 
 def set_wifi_post( address, ssid, pw, static_ip, ip_mask, gateway ):
     if static_ip:
-        print( "Support of static IP TBD" )
-        sys.exit( 0 )
-
-    return ( 'http://' + address + '/rpc', 
-             '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta1":{"ssid":"' + ssid + '", "pass":"' + pw + '", "enable": true}}}}' )
+        gw = ( '"gw":"' + gateway + '", ') if gateway else ''
+        return ( 'http://' + address + '/rpc', 
+                 '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta":{"ssid":"' + ssid + '", "pass":"' + pw + '", ' +
+                 '"ipv4mode":"static", "netmask":"' + ip_mask + '", ' + gw + '"ip":"' + static_ip + '", "enable": true, "nameserver":null}}}}' )
+    else:
+        return ( 'http://' + address + '/rpc', 
+                 '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta1":{"ssid":"' + ssid + '", "pass":"' + pw + '", "enable": true}}}}' )
 
 def disable_ap_post( address ):
     return ( 'http://' + address + '/rpc', 
@@ -2751,14 +2753,15 @@ def provision_device( addr, tries, args, ssid, pw, cfg ):
                 else:
                     req = set_wifi_get( addr, ssid, pw, static_ip, netmask, gateway )
                     content = json.loads( url_read( req ) )
-                if args.verbose > 2:
+                if 'error' in content or args.verbose > 2:
                     print( repr( [req, data] ) )
                     print( repr( content ) )
-                got_one = True
+                if 'error' not in content:
+                    got_one = True
             except:
                 if not got_one: eprint( "Unexpected error [B]:", sys.exc_info( )[0] )
         if got_one: return True
-    print( "Tried 15 times and could not instruct device to set up network" )
+    print( "Tried multiple times and could not instruct device to set up network" )
     return False
 
 def gen2_rpc( verbosity, txn ):
@@ -2922,10 +2925,10 @@ def provision_ddwrt( args, new_version ):
                     if stat: break
                     
                     if attempts >= 10:
-                        print( "Device failed to take AP provisioning instructions after 10 attempts." )
+                        print( "Device failed to take WiFi provisioning instructions after 10 attempts." )
                         sys.exit( )
                     else:
-                        print( "Device failed to take AP provisioning instructions. Trying again." )
+                        print( "Device failed to take WiFi provisioning instructions. Trying again." )
                         next
 
                 # If just one ddwrt device, then switch from sta back to AP now
