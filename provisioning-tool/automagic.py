@@ -1959,8 +1959,6 @@ def set_MQTT_post( rec ):
     else:
         params = '{ "id":1, "src":"user_1", "method":"MQTT.SetConfig", "params":{"config":{"enable": false }}}'
 
-    print( params )
-
     return ( 'http://' + rec[ 'IP' ] + '/rpc', params )
 
 def status_url( address ):
