@@ -147,7 +147,7 @@ else:
 version = "1.0010"
 
 required_keys = [ 'SSID', 'Password' ]
-optional_keys = [ 'StaticIP', 'NetMask', 'Gateway', 'Group', 'Label', 'ProbeIP', 'Tags', 'DeviceName', 'LatLng', 'TZ', 'Access', 'MQTTServer', 'MQTTUser', 'MQTTPassword', 'MQTTCert' ]
+optional_keys = [ 'StaticIP', 'NetMask', 'Gateway', 'NameServer', 'Group', 'Label', 'ProbeIP', 'Tags', 'DeviceName', 'LatLng', 'TZ', 'Access', 'MQTTServer', 'MQTTUser', 'MQTTPassword', 'MQTTCert' ]
 default_query_columns = [ 'type', 'Origin', 'IP', 'ID', 'fw', 'has_update', 'settings.name' ] 
 
 all_operations = ( 'help', 'features', 'provision', 'provision-list', 'factory-reset', 'flash', 'import', 'list', 'clear-list', 
@@ -480,7 +480,7 @@ def help_import( more = None ):
                  The example above would create instructions to program the next two devices discovered via 
                  provision-list with the credentials specified.
 
-                 Optional fields are: StaticIP, NetMask, Gateway, Group, Label, ProbeIP, and Tags.
+                 Optional fields are: StaticIP, NetMask, Gateway, NameServer, Group, Label, ProbeIP, and Tags.
 
                      DeviceName                  If specified, the value name of the device will be set.  (settings/name)
 
@@ -492,7 +492,11 @@ def help_import( more = None ):
                      NetMask                     A NetMask must be included when a StaticIP is set.  The NetMask determines what
                                                  IP addresses are on the local subnet vs. routed.
 
-                     Gateway                     A Gateway shoule be included when a StaticIP is set.  It is needed for the device
+                     Gateway                     A Gateway should be included when a StaticIP is set.  It is needed for the device
+                                                 to reach any services like sntp, to get the time, or to download OTA updates.
+
+                     NameServer                  Address of DNS server to be included when a StaticIP is set. 
+
                                                  to reach any services like sntp, to get the time, or to download OTA updates.
 
                      LatLng                      Latitude and longitude, for sunrise/sunset calculations, in the form lat:lng,
@@ -1571,7 +1575,7 @@ def ddwrt_ssh_loopback( node, verbose = 0 ):
 def ddwrt_get_single_line_result( cn, cmd ):
     ( result, err ) = ddwrt_do_cmd( cn['conn'], cmd, cn['eot'] )
     if err != "":
-        raise Exception( err )
+        raise Exception( '\nError programming dd-wrt modes. You may need to reboot the device.\n' + err )
     if len( result ) > 2:
         raise Exception( 'multi-line response' )
     return( result[0] )
@@ -1914,22 +1918,23 @@ def write_json_file( f, j ):
 #   Shelly-specific HTTP logic
 ####################################################################################
 
-def set_wifi_get( address, ssid, pw, static_ip, ip_mask, gateway ):
+def set_wifi_get( address, ssid, pw, static_ip, ip_mask, gateway, nameserver ):
     if static_ip:
         gw = ( "&gateway=" + gateway ) if gateway else ''
-        return "http://" + address + "/settings/sta/?enabled=1&ssid=" + urlquote(ssid) + "&key=" + urlquote(pw) + "&ipv4_method=static&ip=" + static_ip + "&netmask=" + ip_mask + gw
+        dns = ( "&nameserver=" + nameserver ) if nameserver else ''
+        return "http://" + address + "/settings/sta/?enabled=1&ssid=" + urlquote(ssid) + "&key=" + urlquote(pw) + "&ipv4_method=static&ip=" + static_ip + "&netmask=" + ip_mask + gw + nameserver
     else:
         return "http://" + address + "/settings/sta/?enabled=1&ssid=" + urlquote(ssid) + "&key=" + urlquote(pw) + "&ipv4_method=dhcp"
 
-def set_wifi_post( address, ssid, pw, static_ip, ip_mask, gateway ):
+def set_wifi_post( address, ssid, pw, static_ip, ip_mask, gateway, nameserver ):
     if static_ip:
         gw = ( '"gw":"' + gateway + '", ') if gateway else ''
-        return ( 'http://' + address + '/rpc', 
-                 '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta":{"ssid":"' + ssid + '", "pass":"' + pw + '", ' +
-                 '"ipv4mode":"static", "netmask":"' + ip_mask + '", ' + gw + '"ip":"' + static_ip + '", "enable": true, "nameserver":null}}}}' )
+        dns = ( '"nameserver":"' + nameserver + '", ') if nameserver else ''
+        params = '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta":{"ssid":"' + ssid + '", "pass":"' + pw + '", ' + \
+                 '"ipv4mode":"static", "netmask":"' + ip_mask + '", ' + gw + dns + '"ip":"' + static_ip + '", "enable": true, "nameserver":null}}}}'
     else:
-        return ( 'http://' + address + '/rpc', 
-                 '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta1":{"ssid":"' + ssid + '", "pass":"' + pw + '", "enable": true}}}}' )
+        params = '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta":{"ssid":"' + ssid + '", "pass":"' + pw + '", "enable": true}}}}'
+    return ( 'http://' + address + '/rpc', params )
 
 def disable_ap_post( address ):
     return ( 'http://' + address + '/rpc', 
@@ -2207,7 +2212,7 @@ def finish_up_device( device, rec, operation, args, new_version, initial_status,
     #    need_update = True
     #    rec['settings'] = new_settings
 
-    disable_ap_mode( args, rec[ 'IP' ] )
+    if not args.keep_ap: disable_ap_mode( args, rec[ 'IP' ] )
     disable_BLE( args, rec[ 'IP' ] )
     set_MQTT( args, rec )
 
@@ -2785,6 +2790,7 @@ def provision_device( addr, tries, args, ssid, pw, cfg ):
     static_ip = cfg[ 'StaticIP' ] if 'StaticIP' in cfg and args.operation == 'provision-list' else None
     netmask = cfg[ 'NetMask' ] if 'StaticIP' in cfg and args.operation == 'provision-list' else None
     gateway = cfg[ 'Gateway' ] if 'StaticIP' in cfg and args.operation == 'provision-list' else None
+    nameserver = cfg[ 'NameServer' ] if 'StaticIP' in cfg and args.operation == 'provision-list' and 'NameServer' in cfg else None
 
     for i in range(5):
         time.sleep( args.pause_time )
@@ -2792,11 +2798,11 @@ def provision_device( addr, tries, args, ssid, pw, cfg ):
         for j in range(tries):
             try:
                 if dev_gen == 2:
-                    ( req, data ) = set_wifi_post( addr, ssid, pw, static_ip, netmask, gateway )
+                    ( req, data ) = set_wifi_post( addr, ssid, pw, static_ip, netmask, gateway, nameserver )
                     res = rpc_post( req, data )
                     content = json.loads( res )
                 else:
-                    req = set_wifi_get( addr, ssid, pw, static_ip, netmask, gateway )
+                    req = set_wifi_get( addr, ssid, pw, static_ip, netmask, gateway, nameserver )
                     content = json.loads( url_read( req ) )
                 if 'error' in content or args.verbose > 2:
                     print( repr( [req, data] ) )
@@ -3075,7 +3081,7 @@ def print_list( queue_file, group ):
     check_for_device_queue( device_queue, group, fail=False )
 
     print( "List of devices for probe-list or provision-list operation" )
-    header = [ 'ProbeIP', 'Group', 'SSID', 'Password', 'StaticIP', 'NetMask', 'Gateway', 'DeviceName', 'InsertTime', 'CompletedTime' ]
+    header = [ 'ProbeIP', 'Group', 'SSID', 'Password', 'StaticIP', 'NetMask', 'Gateway', 'NameServer', 'DeviceName', 'InsertTime', 'CompletedTime' ]
     col_widths = [ 0 ] * len(header)
     result = [ header, [] ]
     for d in device_queue:
@@ -3199,8 +3205,8 @@ def validate_options( p, vars ):
               "apply" : [ "query_conditions", "query_columns", "group", "set_tag", "match_tag", "delete_tag", 
                           "ota", "apply_urls", "refresh", "delete_device", "restore_device", "dry_run", "settings", "access" ],
               "probe-list" : [ "query_conditions", "group", "refresh", "access" ],
-              "provision-list" : [ "group", "ddwrt_name", "group", "cue", "timing", "ota", "print_using", "toggle", "wait_time", "settings" ],
-              "provision" : [ "ssid", "wait_time", "ota", "print_using", "toggle", "cue", "settings" ],
+              "provision-list" : [ "group", "ddwrt_name", "group", "cue", "timing", "ota", "print_using", "toggle", "wait_time", "settings", "keep_ap" ],
+              "provision" : [ "ssid", "wait_time", "ota", "print_using", "toggle", "cue", "settings", "keep_ap" ],
               "acceptance-test" : [ "ssid" ],
               "config-test" : [ "ssid" ],
               "list" : [ "group" ],
@@ -3293,6 +3299,7 @@ def main():
     p.add_argument(       '--from-device', metavar='DEVICE-ID', help='Device db entry from which to copy settings using the replace operation' )
     p.add_argument(       '--to-device', metavar='DEVICE-ID', help='Device db entry to receive the copy of settings using the replace operation' )
     p.add_argument(       '--dry-run', action='store_true', help='Display urls to apply instead of performing --restore or --settings' )
+    p.add_argument(       '--keep-ap', action='store_true', help='Keep AP configured (on Plus devices)' )
     p.add_argument(       '--settings', help='Comma separated list of name=value settings for use with provision operation' )
     p.add_argument(       metavar='OPERATION', help='|'.join(all_operations), dest="operation", choices=all_operations )
 
