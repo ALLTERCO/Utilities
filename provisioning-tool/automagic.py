@@ -24,6 +24,8 @@
 #
 #  Changes:
 #
+# 1.0011     Minimal support for Plus/nextGen devices
+#
 # 1.0010     Now caches OTA build info
 #            
 # 1.0009     DD-WRT works with spaces and "&" in SSID
@@ -145,7 +147,7 @@ else:
 version = "1.0010"
 
 required_keys = [ 'SSID', 'Password' ]
-optional_keys = [ 'StaticIP', 'NetMask', 'Gateway', 'Group', 'Label', 'ProbeIP', 'Tags', 'DeviceName', 'LatLng', 'TZ', 'Access' ]
+optional_keys = [ 'StaticIP', 'NetMask', 'Gateway', 'Group', 'Label', 'ProbeIP', 'Tags', 'DeviceName', 'LatLng', 'TZ', 'Access', 'MQTTServer', 'MQTTUser', 'MQTTPassword', 'MQTTCert' ]
 default_query_columns = [ 'type', 'Origin', 'IP', 'ID', 'fw', 'has_update', 'settings.name' ] 
 
 all_operations = ( 'help', 'features', 'provision', 'provision-list', 'factory-reset', 'flash', 'import', 'list', 'clear-list', 
@@ -355,7 +357,7 @@ def help_provision( more = None ):
                                                          print( repr( dev_info ) )
 
                      --settings N=V,N=V...       Supply LatLng or other values to apply during provisioning step.  Supported attributes:
-                                                 DeviceName, LatLng, TZ
+                                                 DeviceName, LatLng, TZ, MQTTServer, MQTTUser, MQTTPassword, MQTTCert
                 """))
 
 def help_provision_list( more = None ):
@@ -421,7 +423,7 @@ def help_provision_list( more = None ):
                      --time-to-pause (-p)        Time to pause after various provisioning steps
 
                      --settings N=V,N=V...       Supply LatLng or defaults other values to apply during provisioning step.  Supported 
-                                                 attributes: DeviceName, LatLng, TZ
+                                                 attributes: DeviceName, LatLng, TZ, MQTTServer, MQTTUser, MQTTPassword, MQTTCert
                 """))
 
 def help_ddwrt_learn( more = None ):
@@ -518,6 +520,15 @@ def help_import( more = None ):
                                                  some battery powered devices, only periodically. Values: Continuous or Periodic.
                                                  Works in conjunction with ProbeIP and the probe-list operation to find periodic 
                                                  devices which take much longer to discover.
+
+                     MQTTServer                  MQTT server address:port
+
+                     MQTTUser                    MQTT username
+
+                     MQTTPassword                MQTT password
+
+                     MQTTCert                    (Plus devices only) MQTT CA for mqtts
+
                 """))
 
 def help_list( more = None ):
@@ -640,7 +651,7 @@ def help_apply( more = None ):
                                                  like "http://192.168.1.10//settings/?lat=31.32&lng=-98.324"
 
                      --settings N=V,N=V...       Supply LatLng or other values to apply to all matching devices.  Supported attributes:
-                                                     DeviceName, LatLng, TZ
+                                                     DeviceName, LatLng, TZ, MQTTServer, MQTTUser, MQTTPassword, MQTTCert
 
                      --dry-run                   When used with --restore-device, --url, and --settings, displays, rather than executes, 
                                                  the steps (urls) which would be applied to each matching device.
@@ -1538,21 +1549,24 @@ def ddwrt_ssh_loopback( node, verbose = 0 ):
     ddwrt_do_cmd( tn, 'pwd', node['eot'], verbose )
 
     dbg = tn.read_very_eager()   # throw away any pending junk
-    if verbose: print( "(1)" + dbg )
+    if verbose > 2: print( "(1)" + dbg )
     tn.write(b"echo ${z}BOT${z};(" + cmd.encode('ascii') + b")\n")
-    dbg = tn.read_until(pw_prompt.encode('ascii'),10)
-    if verbose: print( "(2)" + dbg )
+    response = tn.read_until(pw_prompt.encode('ascii'),10)
+    if "ssh: not found"  in response:
+        raise Exception( 'ssh is not available on dd-wrt device ' + node[ 'router' ][ 'name' ] )
+     
+    if verbose > 2: print( "(2)" + response )
     tn.write(pw.encode('ascii'))
     dbg = tn.read_until(shell_prompt.encode('ascii'),2)
-    if verbose: print( "(3)" + dbg )
+    if verbose > 2: print( "(3)" + dbg )
     dbg = tn.read_very_eager()
-    if verbose: print( "(4)" + dbg )
+    if verbose > 2: print( "(4)" + dbg )
     ddwrt_sync_connection( node, b"PS1="+node['eot']+b"\\\\n;", 2 )
     dbg = tn.read_very_eager()
-    if verbose: print( "(5)" + dbg )
+    if verbose > 2: print( "(5)" + dbg )
     ddwrt_do_cmd( tn, 'pwd', node['eot'] )
     dbg = tn.read_very_eager()
-    if verbose: print( "(6)" + dbg )
+    if verbose > 2: print( "(6)" + dbg )
 
 def ddwrt_get_single_line_result( cn, cmd ):
     ( result, err ) = ddwrt_do_cmd( cn['conn'], cmd, cn['eot'] )
@@ -1611,7 +1625,8 @@ def ddwrt_program_mode( cn, pgm, from_db, deletes=None ):
     else:
         cn[ 'current_mode' ] = mode
         ddwrt_apply( cn[ 'router' ][ 'address' ], 'admin', cn[ 'router' ][ 'password' ] )
-        print( "changing dd-wrt mode to " + mode + "... configuration sent, now waiting for dd-wrt to apply changes" )
+        print( "changing dd-wrt device " + cn[ 'router' ][ 'name' ] + " at address " + cn[ 'router' ][ 'address' ] + 
+              " mode to " + mode + "... configuration sent, now waiting for dd-wrt to apply changes" )
         time.sleep( 5 )
         ddwrt_sync_connection( cn, b'', 20 )
         ddwrt_get_single_line_result( cn, "wl radio off; wl radio on" )
@@ -1856,31 +1871,6 @@ def get_url( addr, tm, verbose, url, operation, tmout = 2 ):
     if raw_data: print( "Raw results from last attempt: " + raw_data )
     return None
 
-def set_wifi_get( address, ssid, pw, static_ip, ip_mask, gateway ):
-    if static_ip:
-        gw = ( "&gateway=" + gateway ) if gateway else ''
-        return "http://" + address + "/settings/sta/?enabled=1&ssid=" + urlquote(ssid) + "&key=" + urlquote(pw) + "&ipv4_method=static&ip=" + static_ip + "&netmask=" + ip_mask + gw
-    else:
-        return "http://" + address + "/settings/sta/?enabled=1&ssid=" + urlquote(ssid) + "&key=" + urlquote(pw) + "&ipv4_method=dhcp"
-
-def set_wifi_post( address, ssid, pw, static_ip, ip_mask, gateway ):
-    if static_ip:
-        gw = ( '"gw":"' + gateway + '", ') if gateway else ''
-        return ( 'http://' + address + '/rpc', 
-                 '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta":{"ssid":"' + ssid + '", "pass":"' + pw + '", ' +
-                 '"ipv4mode":"static", "netmask":"' + ip_mask + '", ' + gw + '"ip":"' + static_ip + '", "enable": true, "nameserver":null}}}}' )
-    else:
-        return ( 'http://' + address + '/rpc', 
-                 '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta1":{"ssid":"' + ssid + '", "pass":"' + pw + '", "enable": true}}}}' )
-
-def disable_ap_post( address ):
-    return ( 'http://' + address + '/rpc', 
-             '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"ap":{"enable": false}}}}' )
-
-def disable_BLE_post( address ):
-    return ( 'http://' + address + '/rpc', 
-             '{ "id":1, "src":"user_1", "method":"BLE.SetConfig", "params":{"config":{"enable": false}}}' )
-
 ####################################################################################
 #   JSON Utilities
 ####################################################################################
@@ -1924,6 +1914,55 @@ def write_json_file( f, j ):
 #   Shelly-specific HTTP logic
 ####################################################################################
 
+def set_wifi_get( address, ssid, pw, static_ip, ip_mask, gateway ):
+    if static_ip:
+        gw = ( "&gateway=" + gateway ) if gateway else ''
+        return "http://" + address + "/settings/sta/?enabled=1&ssid=" + urlquote(ssid) + "&key=" + urlquote(pw) + "&ipv4_method=static&ip=" + static_ip + "&netmask=" + ip_mask + gw
+    else:
+        return "http://" + address + "/settings/sta/?enabled=1&ssid=" + urlquote(ssid) + "&key=" + urlquote(pw) + "&ipv4_method=dhcp"
+
+def set_wifi_post( address, ssid, pw, static_ip, ip_mask, gateway ):
+    if static_ip:
+        gw = ( '"gw":"' + gateway + '", ') if gateway else ''
+        return ( 'http://' + address + '/rpc', 
+                 '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta":{"ssid":"' + ssid + '", "pass":"' + pw + '", ' +
+                 '"ipv4mode":"static", "netmask":"' + ip_mask + '", ' + gw + '"ip":"' + static_ip + '", "enable": true, "nameserver":null}}}}' )
+    else:
+        return ( 'http://' + address + '/rpc', 
+                 '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta1":{"ssid":"' + ssid + '", "pass":"' + pw + '", "enable": true}}}}' )
+
+def disable_ap_post( address ):
+    return ( 'http://' + address + '/rpc', 
+             '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"ap":{"enable": false}}}}' )
+
+def disable_BLE_post( address ):
+    return ( 'http://' + address + '/rpc', 
+             '{ "id":1, "src":"user_1", "method":"BLE.SetConfig", "params":{"config":{"enable": false}}}' )
+
+def json_null( s ):
+    if not s:
+        return( 'null' )
+    return '"' + s.replace('"','\"') + '"'
+
+def get_val( d, n ):
+    if n in d: return d[ n ]
+    return ''
+
+def set_MQTT_post( rec ):
+    cfg = rec[ 'ConfigInput' ]
+    if get_val( cfg, 'MQTTServer' ):
+        params = '{ "id":1, "src":"user_1", "method":"MQTT.SetConfig", "params":{"config":{"enable": true, "server": ' + json_null( get_val( cfg, 'MQTTServer' ) ) + \
+                     ', "user": ' + json_null( get_val( cfg, 'MQTTUser' ) ) + \
+                     ', "pass": ' + json_null( get_val( cfg, 'MQTTPassword' ) ) + \
+                     ', "ssl_ca": ' + json_null( get_val( cfg, 'MQTTCert' ) ) + \
+                            ' }}}'
+    else:
+        params = '{ "id":1, "src":"user_1", "method":"MQTT.SetConfig", "params":{"config":{"enable": false }}}'
+
+    print( params )
+
+    return ( 'http://' + rec[ 'IP' ] + '/rpc', params )
+
 def status_url( address ):
     if dev_gen == 2:
         return "http://" + address + "/rpc/Sys.GetStatus"
@@ -1935,16 +1974,23 @@ def wifi_status_url( address ):
 
 def get_settings_url( address, rec = None ):
     if dev_gen == 2:
+         return "http://" + address + "/rpc/Sys.GetConfig"
+    else:
+         return "http://" + address + "/settings" + q
+
+def set_settings_url( address, rec = None ):
+    if dev_gen == 2:
          #TODO-KBC - dst stuff?
          return "http://" + address + "/rpc/Sys.GetConfig"
     else:
          map = { "DeviceName" : "name", "LatLng" : "lat:lng", "TZ" : "tz_dst:tz_dst_auto:tz_utc_offset:tzautodetect" }
          parms = {}
          if rec:
-              for tag in map:
-                  if tag in rec:
-                      for elem in zip( map[ tag ].split(':'), rec[ tag ].split(':') ):
-                          parms[ elem[ 0 ]  ] = elem[ 1 ]
+             cfg = rec[ 'ConfigInput' ]
+             for tag in map:
+                 if tag in cfg:
+                     for elem in zip( map[ tag ].split(':'), cfg[ tag ].split(':') ):
+                         parms[ elem[ 0 ]  ] = elem[ 1 ]
          q = "?" + url_encode( parms ) if parms else ""
          return "http://" + address + "/settings" + q
 
@@ -2135,9 +2181,9 @@ def finish_up_device( device, rec, operation, args, new_version, initial_status,
 
     settings = get_name_value_pairs( args.settings, term_type = '--settings' )
     for pair in settings:
-        if pair[0] in ( 'DeviceName', 'LatLng', 'TZ' ):
-            if pair[0] not in rec:
-                rec[ pair[0] ] = pair[1]
+        if pair[0] in ( 'DeviceName', 'LatLng', 'TZ', 'MQTTServer', 'MQTTUser', 'MQTTPassword', 'MQTTCert' ):
+            if pair[0] not in rec[ 'ConfigInput' ]:
+                rec[ 'ConfigInput' ][ pair[0] ] = pair[1]
 
     rec[ 'ConfigStatus' ][ 'Origin' ] = operation
     rec[ 'Brand' ] = 'Shelly'
@@ -2150,7 +2196,7 @@ def finish_up_device( device, rec, operation, args, new_version, initial_status,
         rec[ 'IP' ] = initial_status[ 'wifi_sta' ][ 'ip' ]
 
     rec = copy.deepcopy( rec )
-    if not configured_settings: configured_settings = get_url( device, args.pause_time, args.verbose, get_settings_url( device, rec['ConfigInput'] ), 'to get config' )
+    if not configured_settings: configured_settings = get_url( device, args.pause_time, args.verbose, set_settings_url( device, rec['ConfigInput'] ), 'to get config' )
     rec[ 'status' ] = initial_status
     if configured_settings and 'type' not in configured_settings[ 'device' ]: configured_settings[ 'device' ][ 'type' ] = rec[ 'ConfigStatus' ][ 'factory_ssid' ].split('-')[0]
     rec[ 'settings' ] = configured_settings if configured_settings else {}
@@ -2159,12 +2205,13 @@ def finish_up_device( device, rec, operation, args, new_version, initial_status,
     write_json_file( args.device_db, device_db )
 
     #if 'DeviceName' in rec:
-    #    new_settings = get_url( device, args.pause_time, args.verbose, get_settings_url( device, rec ), 'to set device name' )
+    #    new_settings = get_url( device, args.pause_time, args.verbose, set_settings_url( device, rec ), 'to set device name' )
     #    need_update = True
     #    rec['settings'] = new_settings
 
     disable_ap_mode( args, rec[ 'IP' ] )
     disable_BLE( args, rec[ 'IP' ] )
+    set_MQTT( args, rec )
 
     if args.ota != '':
         if flash_device( device, args.pause_time, args.verbose, args.ota, args.ota_timeout, new_version, args.dry_run ):
@@ -2431,7 +2478,7 @@ def apply( args, new_version, data, need_write ):
             print( get_settings_url( data[ 'IP' ], new_settings ) )
         else:
             # apply_urls (above) depends on this, if both are used (to save time):
-            configured_settings = get_url( data[ 'IP' ], args.pause_time, args.verbose, get_settings_url( data[ 'IP' ], new_settings ), 'to get config' )
+            configured_settings = get_url( data[ 'IP' ], args.pause_time, args.verbose, set_settings_url( data[ 'IP' ], new_settings ), 'to get config' )
             need_write = True
 
     if args.delete_device and ( args.delete_device == 'ALL' or args.delete_device == data[ 'ID' ] ):
@@ -2709,7 +2756,7 @@ def acceptance_test( args, credentials ):
             print( "Failed to find device to test. Pausing for 15s to try again" )
             time.sleep( 15 )
 
-def check_status( ip_address, devname, ssid, rec, new_version, args ):
+def wrap_up( ip_address, devname, ssid, rec, new_version, args ):
     initial_status = get_status( ip_address, args.pause_time, args.verbose )
     wifi_status = None
 
@@ -2779,6 +2826,10 @@ def disable_ap_mode( args, addr ):
 def disable_BLE( args, addr ):
     if dev_gen == 2:
         gen2_rpc( args.verbose, disable_BLE_post( addr ) )
+
+def set_MQTT( args, rec ):
+    if dev_gen == 2:
+        gen2_rpc( args.verbose, set_MQTT_post( rec ) )
 
 def provision_native( credentials, args, new_version ):
     global device_queue, device_db, dev_gen
@@ -2853,11 +2904,17 @@ def provision_native( credentials, args, new_version ):
                 ip_address = found
 
             print( "Attempting to connect to device back on " + ssid )
-            stat = check_status( ip_address, found, ssid, rec, new_version, args )
+            stat = wrap_up( ip_address, found, ssid, rec, new_version, args )
             if stat == 'Quit': return false
             if stat == 'Fail': break
 
-            disable_ap_mode( args, ip_address )
+            # both of these handled in wrap_up/finish_up_device
+            #### disable_ap_mode( args, ip_address )
+            #### disable_BLE( args, ip_address )
+
+            print( "Success" )
+            print( "" )
+
         else:
             if args.wait_time == 0:
                 print("Exiting. No additional devices found and time-to-wait is 0. Set non-zero time-to-wait to poll for multiple devices.")
@@ -2879,6 +2936,7 @@ def provision_ddwrt( args, new_version ):
         if setup_count > 0 and args.cue:
             prompt_to_continue()
         setup_count += 1
+
         sys.stdout.write( "Waiting to discover a new device" )
         while True:
             sys.stdout.write( "." )
@@ -2899,16 +2957,19 @@ def provision_ddwrt( args, new_version ):
                     attempts += 1
                     # With different ddwrt devices, faster to pre-configure AP
                     t1 = timeit.default_timer()
+
                     if ap_node[ 'router' ][ 'et0macaddr' ] != sta_node[ 'router' ][ 'et0macaddr' ]:
+                        # This is required to set the SSID, may or may not need to change modes
                         ddwrt_set_ap_mode( ap_node, cfg[ 'SSID' ], cfg[ 'Password' ] )
 
-                    # do this each time, assuming ssid changes... optimization possible if recognize repeated SSIDs(?)
+                    # do this each time, assuming ssid changes... optimization possible if recognize repeated SSIDs and using two routers(?)
                     ddwrt_set_sta_mode( sta_node, device_ssids[0] )
                     if args.timing: print( 'dd-wrt device configuration time: ', round( timeit.default_timer() - t1, 2 ) )
 
                     t1 = timeit.default_timer()
-                    ddwrt_ssh_loopback( sta_node )
-                    if args.timing: print( 'setting ssh loopback time: ', round( timeit.default_timer() - t1, 2 ) )
+                    if setup_count == 1:
+                        ddwrt_ssh_loopback( sta_node, args.verbose )
+                        if args.timing: print( 'setting ssh loopback time: ', round( timeit.default_timer() - t1, 2 ) )
                     forwarded_addr = sta_node['router']['address'] + ':8001'
 
                     t1 = timeit.default_timer()
@@ -2944,7 +3005,7 @@ def provision_ddwrt( args, new_version ):
                     ip_address = device_ssids[ 0 ]
 
                 print( "Attempting to connect to device on " + cfg['SSID'] )
-                new_status = check_status( ip_address, device_ssids[ 0 ], cfg['SSID'], rec, new_version, args )
+                new_status = wrap_up( ip_address, device_ssids[ 0 ], cfg['SSID'], rec, new_version, args )
                 if new_status == 'Quit': return False
                 if new_status == 'Fail':
                     print( "Failed to find device on network" )
@@ -2959,12 +3020,14 @@ def provision_ddwrt( args, new_version ):
                 if args.verbose > 2: print( repr( new_status ) )
                 print( )
 
-                ### this moved to check_status()
+                ### this moved to wrap_up()
                 ##wifi_status = None
                 ##if dev_gen == 2:
                 ##    wifi_status = get_wifi_status( ip_address, args.pause_time, args.verbose )
                 ##finish_up_device( ip_address, rec, args.operation, args, new_version, new_status, None, wifi_status )
 
+                print( "Success" )
+                print( "" )
                 break
             else:
                 ## print( 'Found no new devices. Waiting ' + str(args.wait_time) + ' seconds before looking again. Press ^C to cancel' )
