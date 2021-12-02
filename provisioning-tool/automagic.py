@@ -2887,7 +2887,7 @@ def provision_native( credentials, args, new_version ):
             write_json_file( args.device_queue, device_queue )
 
             setup_count += 1
-            stat = provision_device( factory_device_addr, 3, args, ssid, pw, cfg )
+            stat = provision_device( factory_device_addr, (3 if dev_gen == 1 else 1), args, ssid, pw, cfg )
 
             ### Connect (back) to main network
             if not wifi_reconnect( credentials ):
@@ -2984,7 +2984,7 @@ def provision_ddwrt( args, new_version ):
 
                     t1 = timeit.default_timer()
                     # try just once if using a single DDWRT device, because of timing... need to reconfigure quickly
-                    tries = 1 if ap_node[ 'router' ][ 'et0macaddr' ] == sta_node[ 'router' ][ 'et0macaddr' ] else 3
+                    tries = 1 if dev_gen == 2 or ap_node[ 'router' ][ 'et0macaddr' ] == sta_node[ 'router' ][ 'et0macaddr' ] else 3
                     stat = provision_device( forwarded_addr, tries, args, cfg[ 'SSID' ], cfg[ 'Password' ], cfg )
                     if args.timing: print( 'settings time: ', round( timeit.default_timer() - t1, 2 ) )
                     if stat: break
@@ -3174,17 +3174,22 @@ def replace_device( db_path, from_device, to_device ):
     write_json_file( db_path, device_db )
 
 def factory_reset( device_address, verbose ):
-    try:
-        contents = json.loads( url_read( "http://" + device_address + "/settings/?reset=1" ) )
-        if verbose > 2:
-            print( repr( contents ) )
-        print( "Reset sent to " + device_address )
-    except BaseException as e:
-        print( "Reset failed" )
-        if any_timeout_reason( e ):
-            print( "Device is not reachable on your network" )
+    tries = 0
+    for path in ("/rpc/Shelly.FactoryReset","/settings/?reset=1"):
+        try:
+            tries += 1
+            contents = json.loads( url_read( "http://" + device_address + path ) )
+            if verbose > 2:
+                print( repr( contents ) )
+            print( "Reset sent to " + device_address )
             return
-        print( "Unexpected error [C]:", sys.exc_info( )[0] )
+        except BaseException as e:
+            if tries == 2:
+                print( "Reset failed" )
+                if any_timeout_reason( e ):
+                    print( "Device is not reachable on your network" )
+                    return
+                print( "Unexpected error [C]:", sys.exc_info( )[0] )
 
 ####################################################################################
 #   Option validation
