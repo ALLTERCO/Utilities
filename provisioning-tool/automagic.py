@@ -431,8 +431,13 @@ def help_ddwrt_learn( more = None ):
                  ddwrt-learn
                  -----------
                  Set up a DD-WRT router in access point mode, with DHCP server disabled, telnet enabled, and ssh enabled.  Use the 
-                 username "admin" and choose a password you are okay with storing in plaintext for use by this program. Static wan 
-                 address 192.168.33.10, gateway 192.168.33.1, subnet mask 255.255.255.0
+                 username "admin" and choose a password you are okay with storing in plaintext for use by this program. In the 
+                 DD-WRT setup section "WAN Setup" / "WAN Connection Type", Set "Connection Type" to "Static IP", with WAN IP Address 192.168.33.10,
+                 Gateway 192.168.33.1, and Subnet Mask 255.255.255.0
+
+                 In the "Network Setup" / "Router IP" section, set up an address on your local subnet (192.168.1.1 in this example).
+
+
 
                  IMPORTANT: On setup page, disable DHCP, enable forced DNS redirection, and on 
                  Services page, disable Dnsmasq entirely.
@@ -2872,7 +2877,10 @@ def provision_native( credentials, args, new_version ):
         t1 = timeit.default_timer()
         found = wifi_connect( credentials, args.prefix, prefix=True, ignore_ssids=prior_ssids, verbose=args.verbose )
         if found:
-            dev_gen = 2 if "Plus" in found else 1
+            if args.force_generation:
+                dev_gen = args.force_generation
+            else:
+                dev_gen = 2 if "Plus" in found else 1
             if args.timing: print( 'discover time: ', round( timeit.default_timer() - t1, 2 ) )
             print( "Ready to provision " + found + " with " + repr( cfg ) )
             prior_ssids[ found ] = 1
@@ -3201,7 +3209,7 @@ def validate_options( p, vars ):
 
     # options/parameters with defaults, or universally allowed
     always = [ 'access', 'operation', 'ddwrt_file', 'pause_time', 'ota_timeout', 'device_db', 
-               'prefix', 'device_queue', 'verbose', 'force_platform' ]
+               'prefix', 'device_queue', 'verbose', 'force_platform', 'force_generation' ]
 
     # options allowed with specific commands
     allow = { "help" : [ "what" ],
@@ -3306,6 +3314,7 @@ def main():
     p.add_argument(       '--dry-run', action='store_true', help='Display urls to apply instead of performing --restore or --settings' )
     p.add_argument(       '--keep-ap', action='store_true', help='Keep AP configured (on Plus devices)' )
     p.add_argument(       '--settings', help='Comma separated list of name=value settings for use with provision operation' )
+    p.add_argument( '-G', '--force-generation', help='Force generation (1 or 2) of device(s) being provisioned' )
     p.add_argument(       metavar='OPERATION', help='|'.join(all_operations), dest="operation", choices=all_operations )
 
     p.add_argument( dest='what', default=None, nargs='*' )
