@@ -430,25 +430,33 @@ def help_ddwrt_learn( more = None ):
     print(dedent(""" 
                  ddwrt-learn
                  -----------
-                 Set up a DD-WRT router in access point mode, with DHCP server disabled, telnet enabled, and ssh enabled.  Use the 
-                 username "admin" and choose a password you are okay with storing in plaintext for use by this program. In the 
-                 DD-WRT setup section "WAN Setup" / "WAN Connection Type", Set "Connection Type" to "Static IP", with WAN IP Address 192.168.33.10,
-                 Gateway 192.168.33.1, and Subnet Mask 255.255.255.0
+                 Use ddwrt-learn to set up one or more DD-WRT routers for use by the program to speed up provisioning and provide more
+                 provisioning options.  This has been tested with Broadcom-based (Linksys) routers.
 
-                 In the "Network Setup" / "Router IP" section, set up an address on your local subnet (192.168.1.1 in this example).
+                 (1) Connect a DD-WRT device configured in client mode, and connected to your LAN to any of its LAN ports. Client mode
+                 is selected in the Wireless/Basic settings screen.  Disable DHCP server, enable telnet and ssh. Use the username "admin" 
+                 and choose a password you are okay with storing in plaintext for use by this program. In the DD-WRT setup section 
+                 "WAN Setup" / "WAN Connection Type", Set "Connection Type" to "Disabled."  In the "Network Setup" / "Router IP" section,
+                 set up an address on your local subnet.
 
-
-
-                 IMPORTANT: On setup page, disable DHCP, enable forced DNS redirection, and on 
-                 Services page, disable Dnsmasq entirely.
+                 IMPORTANT: On setup page, disable DHCP, enable forced DNS redirection, and on Services page, disable Dnsmasq entirely.
 
                  When the device is configured, run ddwrt-learn.
 
-                      ex: python automagic.py ddwrt-learn -N sh1 -p all4shelly -e 192.168.1.1
+                      ex: python automagic.py ddwrt-learn -N sh1 -p all4shelly -e <DD-WRT device address>
 
-                 Change the device WiFi setting to client mode and repeat.
 
-                 This has been tested with Broadcom-based (Linksys) routers.
+                 (2A) For standard use (programming IoT devices in DHCP mode, or static IP addresses all matching the router and subnet of
+                 your existing LAN), re-learn the same DD-WRT device (or better, a second device, with the same settings as above), but change 
+                 the device Wireless setting to AP mode before you repeat the ddwrt-learn step.
+
+                 (2B) ALTERNATIVE -- If you want to be able to provision multiple IoT devices with static addresses and with each with
+                 a different subnet/router, you will need to attach a second DD-WRT device (not the one learned in step 1) to your LAN, this
+                 time connecting its WAN port to your LAN. On this device, you will leave DHCP enabled, and the WAN Connection will be set to
+                 static. Choose your router's address and a free IP address in your static address range. Enable telnet and ssh access, as well
+                 as web, telnet and ssh remote access, in the Administration/Management screen. Use the username "admin" and choose a password 
+                 you are okay with storing in plaintext for use by this program.
+
 
                  Options for use with provision-list:
 
@@ -1561,7 +1569,7 @@ def ddwrt_ssh_loopback( node, verbose = 0 ):
     if verbose > 2: print( "(1)" + dbg )
     tn.write(b"echo ${z}BOT${z};(" + cmd.encode('ascii') + b")\n")
     response = tn.read_until(pw_prompt.encode('ascii'),10)
-    if "ssh: not found" in response.decode("utf-8"):#CHANGE_EIOT
+    if "ssh: not found" in response.decode("utf-8"):    #CHANGE_EIOT
         raise Exception( 'ssh is not available on dd-wrt device ' + node[ 'router' ][ 'name' ] )
      
     if verbose > 2: print( "(2)" + response )
@@ -1577,17 +1585,23 @@ def ddwrt_ssh_loopback( node, verbose = 0 ):
     dbg = tn.read_very_eager()
     if verbose > 2: print( "(6)" + dbg )
 
-def ddwrt_get_single_line_result( cn, cmd ):
+def ddwrt_get_multi_line_result( cn, cmd ):
     ( result, err ) = ddwrt_do_cmd( cn['conn'], cmd, cn['eot'] )
     if err != "":
         raise Exception( '\nError programming dd-wrt modes. You may need to reboot the device.\n' + err )
-    if len( result ) > 2 and cmd != "stopservice nas;stopservice wlconf 2>/dev/null;startservice wlconf 2>/dev/null;startservice nas":#CHANGE_EIOT
+    return( result )
+
+def ddwrt_get_single_line_result( cn, cmd ):
+    result = ddwrt_get_single_line_result( cn, cmd )
+    if len( result ) > 2:
         raise Exception( 'multi-line response' )
     return( result[0] )
 
 def ddwrt_sync_connection( cn, btext, tmout ):
     cn['conn'].write( btext + b"z='####';echo ${z}SYNC${z}\n" )
-    cn['conn'].read_until( b'####SYNC####\r\n', tmout )
+    x = cn['conn'].read_until( b'####SYNC####\r\n', tmout )
+    if "Login incorrect" in x:
+        raise Exception( "Login incorrect" )
     cn['conn'].read_until( cn['eot'], tmout )
 
 def ddwrt_establish_connection( address, user, password, eot ):
@@ -1598,7 +1612,7 @@ def ddwrt_establish_connection( address, user, password, eot ):
         tn.read_until( b"Password: " )
         tn.write( password.encode( 'ascii' ) + b"\n" )
     cn = { 'conn' : tn, 'eot' : eot }
-    ddwrt_sync_connection( cn, b"PS1="+eot+b"\\\\n;", 20 )
+    ddwrt_sync_connection( cn, b"PS1="+eot+b"\\\\n;", 5 )
     return cn
 
 def ddwrt_connect_to_known_router( ddwrt_name ):
@@ -1630,7 +1644,7 @@ def ddwrt_program_mode( cn, pgm, from_db, deletes=None ):
             ddwrt_get_single_line_result( cn, "nvram unset " + k )
     ddwrt_get_single_line_result( cn, "nvram commit 2>/dev/null" )
     if cn[ 'current_mode' ] == mode:
-        ddwrt_get_single_line_result( cn, "stopservice nas;stopservice wlconf 2>/dev/null;startservice wlconf 2>/dev/null;startservice nas" )
+        ddwrt_get_multi_line_result( cn, "stopservice nas;stopservice wlconf 2>/dev/null;startservice wlconf 2>/dev/null;startservice nas" )
     else:
         cn[ 'current_mode' ] = mode
         ddwrt_apply( cn[ 'router' ][ 'address' ], 'admin', cn[ 'router' ][ 'password' ] )
