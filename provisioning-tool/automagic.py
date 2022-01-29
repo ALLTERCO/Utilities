@@ -1561,7 +1561,7 @@ def ddwrt_ssh_loopback( node, verbose = 0 ):
     if verbose > 2: print( "(1)" + dbg )
     tn.write(b"echo ${z}BOT${z};(" + cmd.encode('ascii') + b")\n")
     response = tn.read_until(pw_prompt.encode('ascii'),10)
-    if "ssh: not found"  in response:
+    if "ssh: not found" in response.decode("utf-8"):#CHANGE_EIOT
         raise Exception( 'ssh is not available on dd-wrt device ' + node[ 'router' ][ 'name' ] )
      
     if verbose > 2: print( "(2)" + response )
@@ -1581,7 +1581,7 @@ def ddwrt_get_single_line_result( cn, cmd ):
     ( result, err ) = ddwrt_do_cmd( cn['conn'], cmd, cn['eot'] )
     if err != "":
         raise Exception( '\nError programming dd-wrt modes. You may need to reboot the device.\n' + err )
-    if len( result ) > 2:
+    if len( result ) > 2 and cmd != "stopservice nas;stopservice wlconf 2>/dev/null;startservice wlconf 2>/dev/null;startservice nas":#CHANGE_EIOT
         raise Exception( 'multi-line response' )
     return( result[0] )
 
@@ -1936,7 +1936,7 @@ def set_wifi_post( address, ssid, pw, static_ip, ip_mask, gateway, nameserver ):
         gw = ( '"gw":"' + gateway + '", ') if gateway else ''
         dns = ( '"nameserver":"' + nameserver + '", ') if nameserver else ''
         params = '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta":{"ssid":"' + ssid + '", "pass":"' + pw + '", ' + \
-                 '"ipv4mode":"static", "netmask":"' + ip_mask + '", ' + gw + dns + '"ip":"' + static_ip + '", "enable": true, "nameserver":null}}}}'
+                 '"ipv4mode":"static", "netmask":"' + ip_mask + '", ' + gw + dns + '"ip":"' + static_ip + '", "enable": true, "status_ntf":false, "rpc_ntf":false}}}}'
     else:
         params = '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta":{"ssid":"' + ssid + '", "pass":"' + pw + '", "enable": true}}}}'
     return ( 'http://' + address + '/rpc', params )
