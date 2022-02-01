@@ -2,7 +2,7 @@
 #
 #  IoT Device Provisioning Script
 #  Author: Kerry Clendinning
-#  Copyright (c) 2021 Allterco Robotics US
+#  Copyright (c) 2022 Allterco Robotics US
 #  Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 #  in compliance with the License. You may obtain a copy of the License at:
 #
@@ -14,6 +14,37 @@
 #
 #  Shelly is the Trademark and Intellectual Property of Allterco Robotics Ltd.
 #
+
+# nvram get wan_proto
+# static
+# nvram get wan_ipaddr
+# 192.168.1.3
+
+# nvram get wan_iface
+# vlan1
+
+## forward_spec=provision:on:tcp:81>10.0.0.134:80
+
+# nvram get lan_ifname
+# br0
+
+# ifconfig br0 | grep 'inet addr' | sed -e 's/ Bcast.*//' -e 's/.*://'
+
+# nvram get wan_proto
+# disabled|static|dhcp
+
+
+# iptables -t nat -I PREROUTING -p tcp --dport 82 -j DNAT --to 10.0.0.105:80
+# iptables -I FORWARD -p tcp -d 10.0.0.105  --dport 80 -j ACCEPT
+
+# iptables -I INPUT -p tcp -d 10.0.0.2  --dport 80 -j logaccept
+# iptables -I INPUT -p tcp -d 10.0.0.2  --dport 23 -j logaccept
+# iptables -I INPUT -p tcp -d 10.0.0.2  --dport 22 -j logaccept
+# ifconfig br0 10.0.0.2
+# stopservice lan
+# startservice lan
+
+
 ######################################################################################################################
 #
 #  tl;dr: Run the program with "features" or "help" to learn more
@@ -23,6 +54,8 @@
 ######################################################################################################################
 #
 #  Changes:
+#
+# 1.1000     Added support for NAT to handle multiple routers/subnets being provisioned
 #
 # 1.0011     Minimal support for Plus/nextGen devices
 #
@@ -147,7 +180,7 @@ else:
 version = "1.0010"
 
 required_keys = [ 'SSID', 'Password' ]
-optional_keys = [ 'StaticIP', 'NetMask', 'Gateway', 'NameServer', 'Group', 'Label', 'ProbeIP', 'Tags', 'DeviceName', 'LatLng', 'TZ', 'Access', 'MQTTServer', 'MQTTUser', 'MQTTPassword', 'MQTTCert' ]
+optional_keys = [ 'StaticIP', 'NetMask', 'Gateway', 'NameServer', 'Group', 'Label', 'ProbeIP', 'Tags', 'DeviceName', 'LatLng', 'TZ', 'Access', 'MQTTServer', 'MQTTUser', 'MQTTPassword', 'MQTTCert', 'UserCA' ]
 default_query_columns = [ 'type', 'Origin', 'IP', 'ID', 'fw', 'has_update', 'settings.name' ] 
 
 all_operations = ( 'help', 'features', 'provision', 'provision-list', 'factory-reset', 'flash', 'import', 'list', 'clear-list', 
@@ -357,7 +390,7 @@ def help_provision( more = None ):
                                                          print( repr( dev_info ) )
 
                      --settings N=V,N=V...       Supply LatLng or other values to apply during provisioning step.  Supported attributes:
-                                                 DeviceName, LatLng, TZ, MQTTServer, MQTTUser, MQTTPassword, MQTTCert
+                                                 DeviceName, LatLng, TZ, MQTTServer, MQTTUser, MQTTPassword, MQTTCert, UserCA
                 """))
 
 def help_provision_list( more = None ):
@@ -423,7 +456,7 @@ def help_provision_list( more = None ):
                      --time-to-pause (-p)        Time to pause after various provisioning steps
 
                      --settings N=V,N=V...       Supply LatLng or defaults other values to apply during provisioning step.  Supported 
-                                                 attributes: DeviceName, LatLng, TZ, MQTTServer, MQTTUser, MQTTPassword, MQTTCert
+                                                 attributes: DeviceName, LatLng, TZ, MQTTServer, MQTTUser, MQTTPassword, MQTTCert, UserCA
                 """))
 
 def help_ddwrt_learn( more = None ):
@@ -545,6 +578,8 @@ def help_import( more = None ):
                      MQTTPassword                MQTT password
 
                      MQTTCert                    (Plus devices only) MQTT CA for mqtts
+
+                     UserCA                      (Plus devices only) UserCA
 
                 """))
 
@@ -668,7 +703,7 @@ def help_apply( more = None ):
                                                  like "http://192.168.1.10//settings/?lat=31.32&lng=-98.324"
 
                      --settings N=V,N=V...       Supply LatLng or other values to apply to all matching devices.  Supported attributes:
-                                                     DeviceName, LatLng, TZ, MQTTServer, MQTTUser, MQTTPassword, MQTTCert
+                                                     DeviceName, LatLng, TZ, MQTTServer, MQTTUser, MQTTPassword, MQTTCert, UserCA
 
                      --dry-run                   When used with --restore-device, --url, and --settings, displays, rather than executes, 
                                                  the steps (urls) which would be applied to each matching device.
@@ -1592,7 +1627,7 @@ def ddwrt_get_multi_line_result( cn, cmd ):
     return( result )
 
 def ddwrt_get_single_line_result( cn, cmd ):
-    result = ddwrt_get_single_line_result( cn, cmd )
+    result = ddwrt_get_multi_line_result( cn, cmd )
     if len( result ) > 2:
         raise Exception( 'multi-line response' )
     return( result[0] )
@@ -1633,7 +1668,9 @@ def ddwrt_apply( address, user, password ):
     data = { 'submit_button':'index', 'action':'ApplyTake' }
     http_post( 'http://' + address + '/apply.cgi', data, user, password, 'http://' + address + '/Management.asp' )
 
-def ddwrt_program_mode( cn, pgm, from_db, deletes=None ):
+def ddwrt_program_mode( cn, pgm, from_db, deletes=None, net_cfg = None ):
+    changing_lan_addr = False
+
     for k in pgm.keys():
         ddwrt_get_single_line_result( cn, "nvram set " + k + '="' + pgm[k] + '"' )
     mode = pgm[ 'wl_mode' ]
@@ -1642,28 +1679,53 @@ def ddwrt_program_mode( cn, pgm, from_db, deletes=None ):
     if deletes:
         for k in deletes:
             ddwrt_get_single_line_result( cn, "nvram unset " + k )
+
+    if mode == 'ap' and cn['router']['ap'].get('NAT-capable'):
+        # assume for now, if NAT-capable, the LAN address is always changing.
+        changing_lan_addr = True
+        ( static_ip, netmask, gateway, nameserver ) = net_cfg
+        ddwrt_get_single_line_result( cn, "nvram set lan_ipaddr=" + gateway )
+        ddwrt_get_single_line_result( cn, "nvram set lan_netmask=" + netmask )
+        ddwrt_get_single_line_result( cn, "nvram set lan_gateway=" + gateway )
+        ddwrt_get_single_line_result( cn, "nvram set sv_localdns=" + nameserver )
+        ddwrt_get_single_line_result( cn, "nvram set action_service=index" )
+        ddwrt_get_single_line_result( cn, "nvram set forward_spec=provision:on:tcp:81\>" + static_ip + ":80" )
+        ddwrt_get_single_line_result( cn, "nvram set forwardspec_entries=1" )
+
     ddwrt_get_single_line_result( cn, "nvram commit 2>/dev/null" )
-    if cn[ 'current_mode' ] == mode:
+
+
+    if cn[ 'current_mode' ] == mode and not changing_lan_addr:
         ddwrt_get_multi_line_result( cn, "stopservice nas;stopservice wlconf 2>/dev/null;startservice wlconf 2>/dev/null;startservice nas" )
     else:
         cn[ 'current_mode' ] = mode
         ddwrt_apply( cn[ 'router' ][ 'address' ], 'admin', cn[ 'router' ][ 'password' ] )
-        print( "changing dd-wrt device " + cn[ 'router' ][ 'name' ] + " at address " + cn[ 'router' ][ 'address' ] + 
-              " mode to " + mode + "... configuration sent, now waiting for dd-wrt to apply changes" )
+        device_txt = "dd-wrt device " + cn[ 'router' ][ 'name' ] + " at address " + cn[ 'router' ][ 'address' ]
+        if changing_lan_addr:
+            print( "updating NAT settings on " + device_txt )
+        else:
+            print( "changing " + device_txt + " mode to " + mode + "... configuration sent, now waiting for dd-wrt to apply changes" )
         time.sleep( 5 )
         ddwrt_sync_connection( cn, b'', 20 )
         ddwrt_get_single_line_result( cn, "wl radio off; wl radio on" )
 
-def ddwrt_set_ap_mode( cn, ssid, password ):
-    pgm = { 'pptp_use_dhcp' : '1',        'wan_gateway' : '0.0.0.0',         'wan_ipaddr' : '0.0.0.0',               
-            'wan_netmask' : '0.0.0.0',    'wan_proto' : 'disabled',          'wl0_akm' : 'psk psk2',                 
-            'wl0_mode' : 'ap',            'wl0_nctrlsb' : 'none',            'wl0_security_mode' : 'psk psk2',       
-            'wl0_ssid' : ssid,            'wl_ssid' : ssid,                  'wl0_wpa_psk' : password,               
-            'wl_mode' : 'ap',             'dns_redirect' : '1',              'dnsmasq_enable' : '0'                  
+def ddwrt_set_ap_mode( cn, ssid, password, net_cfg ):
+    pgm = { 'pptp_use_dhcp' : '1',        'wl0_akm' : 'psk psk2',            'wl0_mode' : 'ap',            
+            'wl0_nctrlsb' : 'none',       'wl0_security_mode' : 'psk psk2',  'wl0_ssid' : ssid,            
+            'wl_ssid' : ssid,             'wl0_wpa_psk' : password,          'wl_mode' : 'ap',             
+            'dns_redirect' : '1',
           } 
+
+    if not cn['router']['ap'].get('NAT-capable'):
+        pgm['wan_gateway'] = '0.0.0.0'
+        pgm['wan_netmask'] = '0.0.0.0'
+        pgm['wan_ipaddr'] = '0.0.0.0'
+        pgm['wan_proto'] = 'disabled'
+        pgm['dnsmasq_enable'] = '0'                  
+
     from_db = [ 'wl0_hw_rxchain','wl0_hw_txchain','wan_hwaddr' ]
     deletes = [ 'wan_ipaddr_buf','wan_ipaddr_static','wan_netmask_static', 'wl0_vifs' ]
-    ddwrt_program_mode( cn, pgm, from_db, deletes )
+    ddwrt_program_mode( cn, pgm, from_db, deletes, net_cfg )
 
 def ddwrt_set_sta_mode( cn, ssid ):
     pgm = { 'pptp_use_dhcp' : '0',        'wan_gateway' : '192.168.33.1',    'wan_ipaddr' : '192.168.33.10',                     
@@ -1682,9 +1744,12 @@ def ddwrt_learn( ddwrt_name, ddwrt_address, ddwrt_password, ddwrt_file ):
     cn = ddwrt_establish_connection( ddwrt_address, "root", ddwrt_password, b'#EOT#' )
     ddwrt_info = { }
     et0macaddr = ddwrt_get_single_line_result( cn, "nvram get et0macaddr" )
-    for term in ( 'sta_ifname', 'wan_hwaddr', 'wl0_mode', 'wl0_hw_txchain', 'wl0_hw_rxchain' ):
+    for term in ( 'sta_ifname', 'wan_hwaddr', 'wl0_mode', 'wl0_hw_txchain', 'wl0_hw_rxchain', 'wan_proto', 'wan_ipaddr' ):
         result = ddwrt_get_single_line_result( cn, "nvram get "+term )
         ddwrt_info[term] = result
+
+    if ddwrt_info['wan_proto'] != 'disabled' and ddwrt_info['wan_ipaddr'] == ddwrt_address:
+       ddwrt_info['NAT-capable'] = 1
 
     if ddwrt_name in router_db:
         old_info = router_db[ ddwrt_name ]
@@ -1698,10 +1763,13 @@ def ddwrt_learn( ddwrt_name, ddwrt_address, ddwrt_password, ddwrt_file ):
     else:
         router_db[ ddwrt_name ] = { "name" : ddwrt_name, "address" : ddwrt_address, "password" : ddwrt_password ,
                                     "et0macaddr" : et0macaddr, ddwrt_info[ "wl0_mode" ] : ddwrt_info  }
+
     router_db[ ddwrt_name ][ 'InsertTime' ] = time.time()
     write_json_file( ddwrt_file, router_db )
     print( ddwrt_info[ 'wl0_mode' ] + ' mode learned' )
-    if 'ap' not in router_db[ ddwrt_name ]:
+    if ddwrt_info.get('NAT-capable'):
+        print( 'DD-WRT device is connected via WAN port, which makes NAT addressing possible. It will be used only in ap mode, no need to learn client mode' )
+    elif 'ap' not in router_db[ ddwrt_name ]:
         print( 'ap mode has not been detected yet for this ddwrt device. To use it for verification step, configure ap mode and re-learn' )
     elif 'sta' not in router_db[ ddwrt_name ]:
         print( 'sta mode has not been detected yet for this ddwrt device. To use it for configuration step, configure client mode with static wan address 192.168.33.10 and re-learn' )
@@ -1709,6 +1777,7 @@ def ddwrt_learn( ddwrt_name, ddwrt_address, ddwrt_password, ddwrt_file ):
         print( 'Device is now fully learned, ready for configuration and verification of target' )
 
 def ddwrt_choose_roles( ddwrt_name ):
+    # need to add check that NAT-capable is only used in 2-router configuration
     nodes = []
     ap_node = 0
     sta_node = len( ddwrt_name ) - 1
@@ -1719,10 +1788,11 @@ def ddwrt_choose_roles( ddwrt_name ):
     current_ap = []
     current_sta = []
     for i in range( len(nodes) ):
+        nat_capable = 'ap' in nodes[i]['router'] and nodes[i]['router']['ap'].get('NAT-capable')
         if 'ap' in nodes[i]['router']: ap_capable.append( i )
-        if 'sta' in nodes[i]['router']: sta_capable.append( i )
+        if 'sta' in nodes[i]['router'] and not nat_capable: sta_capable.append( i )
         if 'ap' == nodes[i]['current_mode']: current_ap.append( i )
-        if 'sta' == nodes[i]['current_mode']: current_sta.append( i )
+        if 'sta' == nodes[i]['current_mode'] and not nat_capable: current_sta.append( i )
     if len( ap_capable ) == 0:
         print( "No AP capable dd-wrt device found. Re-learn the device with it set in AP mode" )
         sys.exit()
@@ -1972,7 +2042,7 @@ def get_val( d, n ):
     if n in d: return d[ n ]
     return ''
 
-def set_MQTT_post( rec ):
+def set_MQTT_post( addr, rec ):
     cfg = rec[ 'ConfigInput' ]
     if get_val( cfg, 'MQTTServer' ):
         params = '{ "id":1, "src":"user_1", "method":"MQTT.SetConfig", "params":{"config":{"enable": true, "server": ' + json_null( get_val( cfg, 'MQTTServer' ) ) + \
@@ -1983,7 +2053,13 @@ def set_MQTT_post( rec ):
     else:
         params = '{ "id":1, "src":"user_1", "method":"MQTT.SetConfig", "params":{"config":{"enable": false }}}'
 
-    return ( 'http://' + rec[ 'IP' ] + '/rpc', params )
+    return ( 'http://' + addr + '/rpc', params )
+
+def put_UserCA_post( addr, rec ):
+    cfg = rec[ 'ConfigInput' ]
+    params = '{ "id":1, "src":"user_1", "method":"MQTT.PutUserCA", "params":{"data":' + json_null( get_val( cfg, 'UserCA' ) ) + ' }}'
+
+    return ( 'http://' + addr + '/rpc', params )
 
 def status_url( address ):
     if dev_gen == 2:
@@ -2125,7 +2201,7 @@ def get_firmware_version( ota ):
 
 def check_for_device_queue( dq, group = None, include_complete = False, ssid = None, fail = True ):
     txt = " for SSID " + ssid if ssid else ""
-    txt += ". Use import to specify some provisioning instructions."
+    txt += ". Use import to specify some provisioning instructions, or specify DD-WRT devices to use to provision other networks."
     if len( dq ) == 0:
         print( "List is empty" + txt )
         sys.exit()
@@ -2203,7 +2279,7 @@ def finish_up_device( device, rec, operation, args, new_version, initial_status,
 
     settings = get_name_value_pairs( args.settings, term_type = '--settings' )
     for pair in settings:
-        if pair[0] in ( 'DeviceName', 'LatLng', 'TZ', 'MQTTServer', 'MQTTUser', 'MQTTPassword', 'MQTTCert' ):
+        if pair[0] in ( 'DeviceName', 'LatLng', 'TZ', 'MQTTServer', 'MQTTUser', 'MQTTPassword', 'MQTTCert', 'UserCA' ):
             if pair[0] not in rec[ 'ConfigInput' ]:
                 rec[ 'ConfigInput' ][ pair[0] ] = pair[1]
 
@@ -2231,9 +2307,12 @@ def finish_up_device( device, rec, operation, args, new_version, initial_status,
     #    need_update = True
     #    rec['settings'] = new_settings
 
-    if not args.keep_ap: disable_ap_mode( args, rec[ 'IP' ] )
-    disable_BLE( args, rec[ 'IP' ] )
-    set_MQTT( args, rec )
+    if not args.keep_ap: disable_ap_mode( args, device )
+    disable_BLE( args, device )
+    set_MQTT( args, device, rec )
+
+    if 'UserCA' in rec[ 'ConfigInput' ]:
+        put_UserCA( args, device, rec )
 
     if args.ota != '':
         if flash_device( device, args.pause_time, args.verbose, args.ota, args.ota_timeout, new_version, args.dry_run ):
@@ -2803,13 +2882,17 @@ def wrap_up( ip_address, devname, ssid, rec, new_version, args ):
     print( "Could not find device on " + ssid + ' network' )
     return "Fail"
 
-def provision_device( addr, tries, args, ssid, pw, cfg ):
-    got_one = False
-    print( "Sending network credentials to device" )
+def get_net_cfg( args, cfg ):
     static_ip = cfg[ 'StaticIP' ] if 'StaticIP' in cfg and args.operation == 'provision-list' else None
     netmask = cfg[ 'NetMask' ] if 'StaticIP' in cfg and args.operation == 'provision-list' else None
     gateway = cfg[ 'Gateway' ] if 'StaticIP' in cfg and args.operation == 'provision-list' else None
     nameserver = cfg[ 'NameServer' ] if 'StaticIP' in cfg and args.operation == 'provision-list' and 'NameServer' in cfg else None
+    return ( static_ip, netmask, gateway, nameserver )
+
+def provision_device( addr, tries, args, ssid, pw, net_cfg ):
+    got_one = False
+    print( "Sending network credentials to device" )
+    ( static_ip, netmask, gateway, nameserver ) = net_cfg
 
     for i in range(5):
         time.sleep( args.pause_time )
@@ -2850,9 +2933,13 @@ def disable_BLE( args, addr ):
     if dev_gen == 2:
         gen2_rpc( args.verbose, disable_BLE_post( addr ) )
 
-def set_MQTT( args, rec ):
+def set_MQTT( args, addr, rec ):
     if dev_gen == 2:
-        gen2_rpc( args.verbose, set_MQTT_post( rec ) )
+        gen2_rpc( args.verbose, set_MQTT_post( addr, rec ) )
+
+def put_UserCA( args, addr, rec ):
+    if dev_gen == 2:
+        gen2_rpc( args.verbose, put_UserCA_post( addr, rec ) )
 
 def provision_native( credentials, args, new_version ):
     global device_queue, device_db, dev_gen
@@ -2909,7 +2996,7 @@ def provision_native( credentials, args, new_version ):
             write_json_file( args.device_queue, device_queue )
 
             setup_count += 1
-            stat = provision_device( factory_device_addr, (3 if dev_gen == 1 else 1), args, ssid, pw, cfg )
+            stat = provision_device( factory_device_addr, (3 if dev_gen == 1 else 1), args, ssid, pw, get_net_cfg( args, cfg ) )
 
             ### Connect (back) to main network
             if not wifi_reconnect( credentials ):
@@ -2981,14 +3068,14 @@ def provision_ddwrt( args, new_version ):
                 attempts = 0
                 while True:
                     attempts += 1
-                    # With different ddwrt devices, faster to pre-configure AP
                     t1 = timeit.default_timer()
 
+                    # With different ddwrt devices, faster to pre-configure AP with the target SSID
                     if ap_node[ 'router' ][ 'et0macaddr' ] != sta_node[ 'router' ][ 'et0macaddr' ]:
                         # This is required to set the SSID, may or may not need to change modes
-                        ddwrt_set_ap_mode( ap_node, cfg[ 'SSID' ], cfg[ 'Password' ] )
+                        ddwrt_set_ap_mode( ap_node, cfg[ 'SSID' ], cfg[ 'Password' ], get_net_cfg( args, cfg ) )
 
-                    # do this each time, assuming ssid changes... optimization possible if recognize repeated SSIDs and using two routers(?)
+                    # do this each time, to connect to a new device (different SSID)
                     ddwrt_set_sta_mode( sta_node, device_ssids[0] )
                     if args.timing: print( 'dd-wrt device configuration time: ', round( timeit.default_timer() - t1, 2 ) )
 
@@ -3001,13 +3088,12 @@ def provision_ddwrt( args, new_version ):
                     t1 = timeit.default_timer()
                     if not get_status( forwarded_addr, args.pause_time, args.verbose ):
                         print( "Failed to contact device after connecting to its AP" )
-                        time.sleep(600)
                         sys.exit( )
 
                     t1 = timeit.default_timer()
                     # try just once if using a single DDWRT device, because of timing... need to reconfigure quickly
                     tries = 1 if dev_gen == 2 or ap_node[ 'router' ][ 'et0macaddr' ] == sta_node[ 'router' ][ 'et0macaddr' ] else 3
-                    stat = provision_device( forwarded_addr, tries, args, cfg[ 'SSID' ], cfg[ 'Password' ], cfg )
+                    stat = provision_device( forwarded_addr, tries, args, cfg[ 'SSID' ], cfg[ 'Password' ], get_net_cfg( args, cfg ) )
                     if args.timing: print( 'settings time: ', round( timeit.default_timer() - t1, 2 ) )
                     if stat: break
                     
@@ -3021,11 +3107,13 @@ def provision_ddwrt( args, new_version ):
                 # If just one ddwrt device, then switch from sta back to AP now
                 if ap_node[ 'router' ][ 'et0macaddr' ] == sta_node[ 'router' ][ 'et0macaddr' ]:
                     t1 = timeit.default_timer()
-                    ddwrt_set_ap_mode( ap_node, cfg[ 'SSID' ], cfg[ 'Password' ] )
+                    ddwrt_set_ap_mode( ap_node, cfg[ 'SSID' ], cfg[ 'Password' ], get_net_cfg( args, cfg ) )
                     if args.timing: print( 'dd-wrt device reconfig time: ', round( timeit.default_timer() - t1, 2 ) )
 
                 t1 = timeit.default_timer()
-                if 'StaticIP' in cfg:
+                if ap_node[ 'router' ]['ap'].get('NAT-capable') and 'StaticIP' in cfg:
+                    ip_address = ap_node[ 'router' ][ 'address' ] + ":81"
+                elif 'StaticIP' in cfg:
                     ip_address = cfg[ 'StaticIP' ]
                 else:
                     ip_address = device_ssids[ 0 ]
