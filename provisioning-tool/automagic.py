@@ -14,37 +14,6 @@
 #
 #  Shelly is the Trademark and Intellectual Property of Allterco Robotics Ltd.
 #
-
-# nvram get wan_proto
-# static
-# nvram get wan_ipaddr
-# 192.168.1.3
-
-# nvram get wan_iface
-# vlan1
-
-## forward_spec=provision:on:tcp:81>10.0.0.134:80
-
-# nvram get lan_ifname
-# br0
-
-# ifconfig br0 | grep 'inet addr' | sed -e 's/ Bcast.*//' -e 's/.*://'
-
-# nvram get wan_proto
-# disabled|static|dhcp
-
-
-# iptables -t nat -I PREROUTING -p tcp --dport 82 -j DNAT --to 10.0.0.105:80
-# iptables -I FORWARD -p tcp -d 10.0.0.105  --dport 80 -j ACCEPT
-
-# iptables -I INPUT -p tcp -d 10.0.0.2  --dport 80 -j logaccept
-# iptables -I INPUT -p tcp -d 10.0.0.2  --dport 23 -j logaccept
-# iptables -I INPUT -p tcp -d 10.0.0.2  --dport 22 -j logaccept
-# ifconfig br0 10.0.0.2
-# stopservice lan
-# startservice lan
-
-
 ######################################################################################################################
 #
 #  tl;dr: Run the program with "features" or "help" to learn more
@@ -54,6 +23,8 @@
 ######################################################################################################################
 #
 #  Changes:
+#
+# 1.1000     MQTTS and CA features added
 #
 # 1.1000     Added support for NAT to handle multiple routers/subnets being provisioned
 #
@@ -96,6 +67,8 @@
 ######################################################################################################################
 #
 #  TODO:
+#            Make MQTT toggle work with gen 1 devices
+#
 #            Support devices with access control PIN code
 #
 #            Actions for motion sensor to support interval:
@@ -142,6 +115,7 @@ import re
 import time
 import json
 import argparse
+from argparse import FileType
 import subprocess
 import binascii
 import tempfile
@@ -156,6 +130,11 @@ import importlib
 import collections
 import copy
 import socket
+
+try:
+    import paho.mqtt.publish as publish
+except:
+    pass
 
 try:
     import requests
@@ -180,7 +159,7 @@ else:
 version = "1.0010"
 
 required_keys = [ 'SSID', 'Password' ]
-optional_keys = [ 'StaticIP', 'NetMask', 'Gateway', 'NameServer', 'Group', 'Label', 'ProbeIP', 'Tags', 'DeviceName', 'LatLng', 'TZ', 'Access', 'MQTTServer', 'MQTTUser', 'MQTTPassword', 'MQTTCert', 'UserCA' ]
+optional_keys = [ 'StaticIP', 'NetMask', 'Gateway', 'NameServer', 'Group', 'Label', 'ProbeIP', 'Tags', 'DeviceName', 'LatLng', 'TZ', 'Access', 'MQTTServer', 'MQTTUser', 'MQTTPassword', 'MQTTssl_ca' ]
 default_query_columns = [ 'type', 'Origin', 'IP', 'ID', 'fw', 'has_update', 'settings.name' ] 
 
 all_operations = ( 'help', 'features', 'provision', 'provision-list', 'factory-reset', 'flash', 'import', 'list', 'clear-list', 
@@ -390,7 +369,7 @@ def help_provision( more = None ):
                                                          print( repr( dev_info ) )
 
                      --settings N=V,N=V...       Supply LatLng or other values to apply during provisioning step.  Supported attributes:
-                                                 DeviceName, LatLng, TZ, MQTTServer, MQTTUser, MQTTPassword, MQTTCert, UserCA
+                                                 DeviceName, LatLng, TZ, MQTTServer, MQTTUser, MQTTPassword, MQTTssl_ca
                 """))
 
 def help_provision_list( more = None ):
@@ -456,7 +435,7 @@ def help_provision_list( more = None ):
                      --time-to-pause (-p)        Time to pause after various provisioning steps
 
                      --settings N=V,N=V...       Supply LatLng or defaults other values to apply during provisioning step.  Supported 
-                                                 attributes: DeviceName, LatLng, TZ, MQTTServer, MQTTUser, MQTTPassword, MQTTCert, UserCA
+                                                 attributes: DeviceName, LatLng, TZ, MQTTServer, MQTTUser, MQTTPassword, MQTTssl_ca
                 """))
 
 def help_ddwrt_learn( more = None ):
@@ -577,9 +556,8 @@ def help_import( more = None ):
 
                      MQTTPassword                MQTT password
 
-                     MQTTCert                    (Plus devices only) MQTT CA for mqtts
-
-                     UserCA                      (Plus devices only) UserCA
+                     MQTTssl_ca                  (Plus devices only) Specify mode of ssl "" for none, * for no cert, ca.pem for
+                                                 built-in, or user_ca.pem if also specifying --ca-file
 
                 """))
 
@@ -703,7 +681,7 @@ def help_apply( more = None ):
                                                  like "http://192.168.1.10//settings/?lat=31.32&lng=-98.324"
 
                      --settings N=V,N=V...       Supply LatLng or other values to apply to all matching devices.  Supported attributes:
-                                                     DeviceName, LatLng, TZ, MQTTServer, MQTTUser, MQTTPassword, MQTTCert, UserCA
+                                                     DeviceName, LatLng, TZ, MQTTServer, MQTTUser, MQTTPassword, MQTTssl_ca 
 
                      --dry-run                   When used with --restore-device, --url, and --settings, displays, rather than executes, 
                                                  the steps (urls) which would be applied to each matching device.
@@ -1601,24 +1579,24 @@ def ddwrt_ssh_loopback( node, verbose = 0 ):
     ddwrt_do_cmd( tn, 'pwd', node['eot'], verbose )
 
     dbg = tn.read_very_eager()   # throw away any pending junk
-    if verbose > 2: print( "(1)" + dbg )
+    if verbose > 2: print( b"(1)" + dbg )
     tn.write(b"echo ${z}BOT${z};(" + cmd.encode('ascii') + b")\n")
     response = tn.read_until(pw_prompt.encode('ascii'),10)
     if "ssh: not found" in response.decode("utf-8"):    #CHANGE_EIOT
         raise Exception( 'ssh is not available on dd-wrt device ' + node[ 'router' ][ 'name' ] )
      
-    if verbose > 2: print( "(2)" + response )
+    if verbose > 2: print( b"(2)" + response )
     tn.write(pw.encode('ascii'))
     dbg = tn.read_until(shell_prompt.encode('ascii'),2)
-    if verbose > 2: print( "(3)" + dbg )
+    if verbose > 2: print( b"(3)" + dbg )
     dbg = tn.read_very_eager()
-    if verbose > 2: print( "(4)" + dbg )
+    if verbose > 2: print( b"(4)" + dbg )
     ddwrt_sync_connection( node, b"PS1="+node['eot']+b"\\\\n;", 2 )
     dbg = tn.read_very_eager()
-    if verbose > 2: print( "(5)" + dbg )
+    if verbose > 2: print( b"(5)" + dbg )
     ddwrt_do_cmd( tn, 'pwd', node['eot'] )
     dbg = tn.read_very_eager()
-    if verbose > 2: print( "(6)" + dbg )
+    if verbose > 2: print( b"(6)" + dbg )
 
 def ddwrt_get_multi_line_result( cn, cmd ):
     ( result, err ) = ddwrt_do_cmd( cn['conn'], cmd, cn['eot'] )
@@ -1635,7 +1613,7 @@ def ddwrt_get_single_line_result( cn, cmd ):
 def ddwrt_sync_connection( cn, btext, tmout ):
     cn['conn'].write( btext + b"z='####';echo ${z}SYNC${z}\n" )
     x = cn['conn'].read_until( b'####SYNC####\r\n', tmout )
-    if "Login incorrect" in x:
+    if b"Login incorrect" in x:
         raise Exception( "Login incorrect" )
     cn['conn'].read_until( cn['eot'], tmout )
 
@@ -2048,17 +2026,17 @@ def set_MQTT_post( addr, rec ):
         params = '{ "id":1, "src":"user_1", "method":"MQTT.SetConfig", "params":{"config":{"enable": true, "server": ' + json_null( get_val( cfg, 'MQTTServer' ) ) + \
                      ', "user": ' + json_null( get_val( cfg, 'MQTTUser' ) ) + \
                      ', "pass": ' + json_null( get_val( cfg, 'MQTTPassword' ) ) + \
-                     ', "ssl_ca": ' + json_null( get_val( cfg, 'MQTTCert' ) ) + \
+                     ', "ssl_ca": ' + json_null( get_val( cfg, 'MQTTssl_ca' ) ) + \
                             ' }}}'
     else:
         params = '{ "id":1, "src":"user_1", "method":"MQTT.SetConfig", "params":{"config":{"enable": false }}}'
 
     return ( 'http://' + addr + '/rpc', params )
 
-def put_UserCA_post( addr, rec ):
-    cfg = rec[ 'ConfigInput' ]
-    params = '{ "id":1, "src":"user_1", "method":"MQTT.PutUserCA", "params":{"data":' + json_null( get_val( cfg, 'UserCA' ) ) + ' }}'
-
+def put_UserCA_post( addr, txt, append ):
+    append_bool = repr(bool(append)).lower()
+    params = '{ "id":1, "src":"user_1", "method":"Shelly.PutUserCA", "params":{ "data":' + json_null( txt ) + ',"append":' + append_bool + '} }'
+    time.sleep( 0.5 )
     return ( 'http://' + addr + '/rpc', params )
 
 def status_url( address ):
@@ -2112,6 +2090,16 @@ def get_actions( addr, tm, verbose ):
 def get_toggle_url( ip, dev_type ):
     ### return "http://" + ip + "/" + dev_type + "/0?turn=on&timer=1"
     return "http://" + ip + "/" + dev_type + "/0?turn=toggle"
+
+def mqtt_toggle_device( host, port, user, password, cert, server_key, server_crt, topic ):
+    while True:
+        publish.single( topic,
+                        '{"method":"Switch.Toggle","params":{"id":0}}', 
+                        auth={ "username":user, "password":password }, 
+                        hostname=host,
+                        port=port,
+                        tls = None if not cert else {"ca_certs":cert, "keyfile": server_key, "certfile" : server_crt } )
+        time.sleep( 0.5 )
 
 def toggle_device( ip_address, dev_type, verbosity = 0 ):
     success_cnt = 0
@@ -2272,14 +2260,14 @@ def import_csv( file, queue_file ):
        append_list( reader )
     write_json_file( queue_file, device_queue )
 
-def finish_up_device( device, rec, operation, args, new_version, initial_status, configured_settings, wifi_status ):
+def finish_up_device( device, devname, rec, operation, args, new_version, initial_status, configured_settings, wifi_status ):
     global device_db
     rec[ 'ConfigStatus' ][ 'ConfirmedTime' ] = time.time()
     #need_update = False
 
     settings = get_name_value_pairs( args.settings, term_type = '--settings' )
     for pair in settings:
-        if pair[0] in ( 'DeviceName', 'LatLng', 'TZ', 'MQTTServer', 'MQTTUser', 'MQTTPassword', 'MQTTCert', 'UserCA' ):
+        if pair[0] in ( 'DeviceName', 'LatLng', 'TZ', 'MQTTServer', 'MQTTUser', 'MQTTPassword', 'MQTTssl_ca' ):
             if pair[0] not in rec[ 'ConfigInput' ]:
                 rec[ 'ConfigInput' ][ pair[0] ] = pair[1]
 
@@ -2309,9 +2297,10 @@ def finish_up_device( device, rec, operation, args, new_version, initial_status,
 
     if not args.keep_ap: disable_ap_mode( args, device )
     disable_BLE( args, device )
-    set_MQTT( args, device, rec )
+    if 'MQTTServer' in rec[ 'ConfigInput' ]:
+        set_MQTT( args, device, rec )
 
-    if 'UserCA' in rec[ 'ConfigInput' ]:
+    if args.ca_file:
         put_UserCA( args, device, rec )
 
     if args.ota != '':
@@ -2328,8 +2317,18 @@ def finish_up_device( device, rec, operation, args, new_version, initial_status,
 
     if args.toggle:
         try:
-            print( "Toggling power on newly provisioned device. Unplug to continue." )
-            toggle_device( device, configured_settings['device']['type'] )
+            if args.ca_file:
+                print( "Toggling power on newly provisioned device via mqtt. Unplug the device and hit ^C to continue." )
+                print( repr( rec ) )
+                topic = devname.lower() + "/rpc"
+                cfg = rec[ 'ConfigInput' ]
+                hostport = cfg['MQTTServer'].split(':')
+                host = hostport[0]
+                port = int(hostport[1]) if len(hostport) > 1 else 1883
+                mqtt_toggle_device( host, port, cfg['MQTTUser'], cfg['MQTTPassword'], args.ca_file.name, args.server_key_file.name, args.server_crt_file.name, topic )
+            else:
+                print( "Toggling power on newly provisioned device. Unplug to continue." )
+                toggle_device( device, configured_settings['device']['type'] )
         except KeyboardInterrupt as error:
             print( )
             print( )
@@ -2877,7 +2876,7 @@ def wrap_up( ip_address, devname, ssid, rec, new_version, args ):
         else:
             if dev_gen == 2:
                 wifi_status = get_wifi_status( ip_address, args.pause_time, args.verbose )
-            finish_up_device( ip_address, rec, args.operation, args, new_version, initial_status, None, wifi_status )
+            finish_up_device( ip_address, devname, rec, args.operation, args, new_version, initial_status, None, wifi_status )
             return initial_status
     print( "Could not find device on " + ssid + ' network' )
     return "Fail"
@@ -2939,7 +2938,10 @@ def set_MQTT( args, addr, rec ):
 
 def put_UserCA( args, addr, rec ):
     if dev_gen == 2:
-        gen2_rpc( args.verbose, put_UserCA_post( addr, rec ) )
+        append = False
+        for l in args.ca_text.splitlines(keepends=False):
+            gen2_rpc( args.verbose, put_UserCA_post( addr, l, append ) )
+            append = True
 
 def provision_native( credentials, args, new_version ):
     global device_queue, device_db, dev_gen
@@ -3021,10 +3023,6 @@ def provision_native( credentials, args, new_version ):
             if stat == 'Quit': return false
             if stat == 'Fail': break
 
-            # both of these handled in wrap_up/finish_up_device
-            #### disable_ap_mode( args, ip_address )
-            #### disable_BLE( args, ip_address )
-
             print( "Success" )
             print( "" )
 
@@ -3039,6 +3037,7 @@ def provision_native( credentials, args, new_version ):
 def provision_ddwrt( args, new_version ):
     global device_queue, device_db, dev_gen
     t1 = timeit.default_timer()
+
     check_for_device_queue( device_queue, args.group )
     ( ap_node, sta_node ) = ddwrt_choose_roles( args.ddwrt_name )
     if args.timing: print( 'setup time: ', round( timeit.default_timer() - t1, 2 ) )
@@ -3134,12 +3133,6 @@ def provision_ddwrt( args, new_version ):
                 if args.verbose > 2: print( repr( new_status ) )
                 print( )
 
-                ### this moved to wrap_up()
-                ##wifi_status = None
-                ##if dev_gen == 2:
-                ##    wifi_status = get_wifi_status( ip_address, args.pause_time, args.verbose )
-                ##finish_up_device( ip_address, rec, args.operation, args, new_version, new_status, None, wifi_status )
-
                 print( "Success" )
                 print( "" )
                 break
@@ -3190,7 +3183,7 @@ def append_list( l ):
 def print_list( queue_file, group ):
     check_for_device_queue( device_queue, group, fail=False )
 
-    print( "List of devices for probe-list or provision-list operation" )
+    print( "List of devices for probe-list or provision-list operation, and previously completed devices:" )
     header = [ 'ProbeIP', 'Group', 'SSID', 'Password', 'StaticIP', 'NetMask', 'Gateway', 'NameServer', 'DeviceName', 'InsertTime', 'CompletedTime' ]
     col_widths = [ 0 ] * len(header)
     result = [ header, [] ]
@@ -3317,11 +3310,12 @@ def validate_options( p, vars ):
     allow = { "help" : [ "what" ],
               "query" : [ "query_conditions", "query_columns", "group", "set_tag", "match_tag", "delete_tag", "refresh" ],
               "schema" : [ "query_conditions", "query_columns", "group", "match_tag", "refresh" ],
-              "apply" : [ "query_conditions", "query_columns", "group", "set_tag", "match_tag", "delete_tag", 
+              "apply" : [ "query_conditions", "query_columns", "group", "set_tag", "match_tag", "delete_tag", "ca_file", "server_key_file", "server_crt_file",
                           "ota", "apply_urls", "refresh", "delete_device", "restore_device", "dry_run", "settings", "access" ],
               "probe-list" : [ "query_conditions", "group", "refresh", "access" ],
-              "provision-list" : [ "group", "ddwrt_name", "group", "cue", "timing", "ota", "print_using", "toggle", "wait_time", "settings", "keep_ap" ],
-              "provision" : [ "ssid", "wait_time", "ota", "print_using", "toggle", "cue", "settings", "keep_ap" ],
+              "provision-list" : [ "group", "ddwrt_name", "group", "cue", "timing", "ota", "print_using", "toggle", "wait_time", "settings", "keep_ap", 
+                                   "ca_file", "server_key_file", "server_crt_file" ],
+              "provision" : [ "ssid", "wait_time", "ota", "print_using", "toggle", "cue", "settings", "keep_ap", "ca_file", "server_key_file", "server_crt_file" ],
               "acceptance-test" : [ "ssid" ],
               "config-test" : [ "ssid" ],
               "list" : [ "group" ],
@@ -3417,6 +3411,9 @@ def main():
     p.add_argument(       '--keep-ap', action='store_true', help='Keep AP configured (on Plus devices)' )
     p.add_argument(       '--settings', help='Comma separated list of name=value settings for use with provision operation' )
     p.add_argument( '-G', '--force-generation', help='Force generation (1 or 2) of device(s) being provisioned' )
+    p.add_argument(       '--ca-file', type=FileType('r'), help='Path to UserCA file' )
+    p.add_argument(       '--server-key-file', type=FileType('r'), help='Path to server key file' )
+    p.add_argument(       '--server-crt-file', type=FileType('r'), help='Path to server crt file' )
     p.add_argument(       metavar='OPERATION', help='|'.join(all_operations), dest="operation", choices=all_operations )
 
     p.add_argument( dest='what', default=None, nargs='*' )
@@ -3444,6 +3441,10 @@ def main():
         help_docs( args.what )
         return
 
+    if ( args.ca_file or args.server_key_file or args.server_crt_file ) and ( not args.ca_file or not args.server_key_file or not args.server_crt_file ):
+        p.error( "All three options, --ca-file, --server-key-file, and --server-crt-file must be specified" )
+        return
+
     if args.operation == 'features':
         help_features( )
         return
@@ -3455,6 +3456,8 @@ def main():
     if args.operation in [ 'provision-list' ] and args.ddwrt_name and len( args.ddwrt_name ) > 2:
         p.error( "the provision-list operation accepts no more than two --ddwrt-name (-N) options" )
         return
+
+    args.ca_text = args.ca_file.read() if args.ca_file else None
 
     if args.force_platform:
         platform = args.force_platform
@@ -3593,24 +3596,3 @@ if __name__ == '__main__':
         pass
     except KeyboardInterrupt as error:
         pass
-
-### examples of GUI interaction with DD-WRT device
-###   curl --referer http://192.168.1.1/Management.asp -d submit_button=Management -d action=Reboot -u admin:password --http1.1 -v http://192.168.1.1/apply.cgi
-###   curl http://192.168.1.1/apply.cgi -d "submit_button=Ping&action=ApplyTake&submit_type=start&change_action=gozila_cgi&next_page=Diagnostics.asp&ping_ip=route+add+-net+21.5.128.0+netmask+255.255.128.0+dev+ppp0" -u admin:admin
-###   curl -u admin:pw --referer http://192.168.1.1/Management.asp --http1.1 http://192.168.1.1/apply.cgi -d "submit_button=Status_Internet&action=Apply&change_action=gozila_cgi&submit_type=Disconnect_pppoe
-###   curl -u admin:pw --referer http://192.168.1.1/Management.asp --http1.1 http://192.168.1.1/apply.cgi -d "submit_button=index&action=ApplyTake&change_action=&submit_type="
-
-#def ddwrt_apply( tn, mode ):
-#    """failed attempt to do everything the "apply" button in the GUI does, to avoid needing to use http/CGI approach (which takes 20s)"""
-#    if mode == 'sta':
-#        ddwrt_get_single_line_result( tn, "/sbin/ifconfig eth2 192.168.33.10" )
-#    ddwrt_get_single_line_result( tn, "stopservice nas;stopservice wlconf;startservice wlconf 2>/dev/null;startservice nas" )
-#    if mode == 'sta':
-#        ddwrt_get_single_line_result( tn, "route del default netmask 0.0.0.0 dev br0" )
-#        ddwrt_get_single_line_result( tn, "route add -net 192.168.33.0 netmask 255.255.255.0 dev eth2" )
-#        ddwrt_get_single_line_result( tn, "route add default gw 192.168.33.1 netmask 0.0.0.0 dev br0" )
-#        ddwrt_get_single_line_result( tn, "route add default gw 192.168.33.1 netmask 0.0.0.0 dev eth2" )
-#    else:
-#        ddwrt_get_single_line_result( tn, "route del -net 192.168.33.0 netmask 255.255.255.0 dev eth2" )
-#        ddwrt_get_single_line_result( tn, "route del default gw 192.168.33.1 netmask 0.0.0.0 dev br0" )
-#        ddwrt_get_single_line_result( tn, "route del default gw 192.168.33.1 netmask 0.0.0.0 dev eth2" )
