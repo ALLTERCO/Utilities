@@ -24,7 +24,9 @@
 #
 #  Changes:
 #
-# 1.1000     MQTTS and CA features added
+# 1.1002     Added reboot and put-ca features, finished work on MQTTS and CA
+#
+# 1.1001     MQTTS and CA features added
 #
 # 1.1000     Added support for NAT to handle multiple routers/subnets being provisioned
 #
@@ -164,7 +166,7 @@ default_query_columns = [ 'type', 'Origin', 'IP', 'ID', 'fw', 'has_update', 'set
 
 all_operations = ( 'help', 'features', 'provision', 'provision-list', 'factory-reset', 'flash', 'import', 'list', 'clear-list', 
                    'ddwrt-learn', 'print-sample', 'probe-list', 'query', 'schema', 'apply', 'identify', 'replace', 'list-versions',
-                   'acceptance-test', 'config-test' )
+                   'acceptance-test', 'config-test', 'reboot', 'put-ca' )
 
 exclude_setting = [ 'unixtime', 'fw', 'time', 'hwinfo', 'build_info', 'device', 'ison', 'has_timer', 'power', 'connected',
         'ext_humidity','ext_switch','ext_sensors','ext_temperature',    #TODO  -- parameter
@@ -303,7 +305,7 @@ def help_operations( more = None ):
                  print-sample       - sends a sample device info record to the custom label printing module (see --print-using)
                  query              - list information from the device database formed from provisioning and probing operations
                  apply              - apply --ota, --url and --settings to devices matching a query from the device database
-                 identify           - toggle power on/off on a given device to identify (by ip-address)
+                 identify           - toggle power on/off on a given device to identify by ip-address or using mqtt
                  replace            - copy the settings of one device to another in the device database
 
                  list-versions      - list prior versions of firmware available for a given device, specified with --device-address (-a)
@@ -2033,11 +2035,10 @@ def set_MQTT_post( addr, rec ):
 
     return ( 'http://' + addr + '/rpc', params )
 
-def put_UserCA_post( addr, txt, append ):
-    append_bool = repr(bool(append)).lower()
-    params = '{ "id":1, "src":"user_1", "method":"Shelly.PutUserCA", "params":{ "data":' + json_null( txt ) + ',"append":' + append_bool + '} }'
-    time.sleep( 0.5 )
-    return ( 'http://' + addr + '/rpc', params )
+#def put_UserCA_post( addr, txt, append ):
+#    append_bool = repr(bool(append)).lower()
+#    params = '{"data":' + json_null( txt ) + ',"append":' + append_bool + '}'
+#    return ( 'http://' + addr + '/rpc/Shelly.PutUserCA', params )
 
 def status_url( address ):
     if dev_gen == 2:
@@ -2091,14 +2092,29 @@ def get_toggle_url( ip, dev_type ):
     ### return "http://" + ip + "/" + dev_type + "/0?turn=on&timer=1"
     return "http://" + ip + "/" + dev_type + "/0?turn=toggle"
 
-def mqtt_toggle_device( host, port, user, password, cert, server_key, server_crt, topic ):
+def mqtt_toggle_device( args, server, user, password, cert, topic ):
+    if 'publish' not in globals():
+        print( 'use pip/pip2 to install MQTT library "paho"')
+        return;
+    hostport = server.split(':')
+    host = hostport[0]
+    port = int(hostport[1]) if len(hostport) > 1 else 1883
+    if not args.force_generation:
+        dev_gen = 2 if "plus" in topic.lower() else 1
+    tls = None
+    if cert:
+        tls = {"ca_certs":cert.name}
+        #if server_key:
+        #    tls["key_file"] = server_key.name
+        #if server_crt:
+        #    tls["certfile"] = server_crt.name
     while True:
         publish.single( topic,
-                        '{"method":"Switch.Toggle","params":{"id":0}}', 
-                        auth={ "username":user, "password":password }, 
+                        '{"method":"Switch.Toggle","params":{"id":0}}' if dev_gen == 2 else "toggle",
+                        auth={ "username":user, "password":password } if user else None, 
                         hostname=host,
                         port=port,
-                        tls = None if not cert else {"ca_certs":cert, "keyfile": server_key, "certfile" : server_crt } )
+                        tls = tls )
         time.sleep( 0.5 )
 
 def toggle_device( ip_address, dev_type, verbosity = 0 ):
@@ -2297,11 +2313,11 @@ def finish_up_device( device, devname, rec, operation, args, new_version, initia
 
     if not args.keep_ap: disable_ap_mode( args, device )
     disable_BLE( args, device )
-    if 'MQTTServer' in rec[ 'ConfigInput' ]:
-        set_MQTT( args, device, rec )
 
-    if args.ca_file:
-        put_UserCA( args, device, rec )
+    if 'MQTTServer' in rec[ 'ConfigInput' ]:
+        if args.ca_file:
+            put_UserCA( args, device )
+        set_MQTT( args, device, rec )
 
     if args.ota != '':
         if flash_device( device, args.pause_time, args.verbose, args.ota, args.ota_timeout, new_version, args.dry_run ):
@@ -2317,15 +2333,14 @@ def finish_up_device( device, devname, rec, operation, args, new_version, initia
 
     if args.toggle:
         try:
-            if args.ca_file:
-                print( "Toggling power on newly provisioned device via mqtt. Unplug the device and hit ^C to continue." )
-                print( repr( rec ) )
-                topic = devname.lower() + "/rpc"
-                cfg = rec[ 'ConfigInput' ]
-                hostport = cfg['MQTTServer'].split(':')
-                host = hostport[0]
-                port = int(hostport[1]) if len(hostport) > 1 else 1883
-                mqtt_toggle_device( host, port, cfg['MQTTUser'], cfg['MQTTPassword'], args.ca_file.name, args.server_key_file.name, args.server_crt_file.name, topic )
+            cfg = rec[ 'ConfigInput' ]
+            if 'MQTTServer' in cfg:
+                print( "Rebooting device prior to toggle, to apply MQTT settings." )
+                reboot( device, args.verbose )
+                time.sleep( 10 )
+                print( "Toggling power on newly provisioned device via MQTT. Unplug the device and hit ^C to continue." )
+                topic = devname.lower() + "/rpc" if dev_gen == 2 else "shellies/" + devname.lower() + "/relay/0/command"
+                mqtt_toggle_device( args, cfg.get('MQTTServer'), cfg.get('MQTTUser'), cfg.get('MQTTPassword'), args.ca_file, topic )
             else:
                 print( "Toggling power on newly provisioned device. Unplug to continue." )
                 toggle_device( device, configured_settings['device']['type'] )
@@ -2916,6 +2931,11 @@ def provision_device( addr, tries, args, ssid, pw, net_cfg ):
     print( "Tried multiple times and could not instruct device to set up network" )
     return False
 
+def gen2_json_rpc( verbose, url, data, append ):
+    ## TODO: python2 compatibility
+    req = {"data": data, "append": append}
+    requests.post(url, json=req, timeout=5)
+
 def gen2_rpc( verbosity, txn ):
     ( req, data ) = txn
     res = rpc_post( req, data )
@@ -2936,12 +2956,16 @@ def set_MQTT( args, addr, rec ):
     if dev_gen == 2:
         gen2_rpc( args.verbose, set_MQTT_post( addr, rec ) )
 
-def put_UserCA( args, addr, rec ):
-    if dev_gen == 2:
-        append = False
-        for l in args.ca_text.splitlines(keepends=False):
-            gen2_rpc( args.verbose, put_UserCA_post( addr, l, append ) )
-            append = True
+def put_UserCA( args, addr ):
+    if dev_gen == 3 and sys.version_info.major >= 3:   ## TODO: python2 compatibility (put_UserCA_post?)
+        pos = 0
+        append=False
+        while pos < len(args.ca_text):
+            chunk = args.ca_text[pos : pos + 1024]
+            gen2_json_rpc( args.verbose, "http://" + addr + "/rpc/Shelly.PutUserCA", chunk, append )
+            append=True
+            pos += len(chunk)
+            time.sleep( 0.5 )
 
 def provision_native( credentials, args, new_version ):
     global device_queue, device_db, dev_gen
@@ -2981,7 +3005,7 @@ def provision_native( credentials, args, new_version ):
         found = wifi_connect( credentials, args.prefix, prefix=True, ignore_ssids=prior_ssids, verbose=args.verbose )
         if found:
             if args.force_generation:
-                dev_gen = args.force_generation
+                dev_gen = int(args.force_generation)
             else:
                 dev_gen = 2 if "Plus" in found else 1
             if args.timing: print( 'discover time: ', round( timeit.default_timer() - t1, 2 ) )
@@ -3214,8 +3238,14 @@ def print_list( queue_file, group ):
 def clear_list( queue_file ):
     write_json_file( queue_file, [] )
 
-def identify( device_address ):
-    toggle_device( device_address, None )
+def identify( args ):
+    if args.device_address:
+        toggle_device( args.device_address, None )
+    else:
+        if not args.force_generation:
+            dev_gen = 2 if "plus" in args.device_id.lower() else 1
+        topic = args.device_id.lower() + "/rpc" if dev_gen == 2 else "shellies/" + args.device_id.lower() + "/relay/0/command"
+        mqtt_toggle_device( args, args.mqtt_server, args.mqtt_user, args.mqtt_password, args.ca_file, topic )
 
 def myfunc( e ): 
     return repr( e[ 'version' ].split('.') )
@@ -3276,6 +3306,24 @@ def replace_device( db_path, from_device, to_device ):
     device_db[ to_device ][ 'actions' ] = device_db[ from_device ][ 'actions' ]
     write_json_file( db_path, device_db )
 
+def reboot( device_address, verbose ):
+    tries = 0
+    for path in ("/rpc/Shelly.Reboot","/reboot"):
+        try:
+            tries += 1
+            contents = json.loads( url_read( "http://" + device_address + path ) )
+            if verbose > 2:
+                print( repr( contents ) )
+            print( "Reboot sent to " + device_address )
+            return
+        except BaseException as e:
+            if tries == 2:
+                print( "Reset failed" )
+                if any_timeout_reason( e ):
+                    print( "Device is not reachable on your network" )
+                    return
+                print( "Unexpected error [C]:", sys.exc_info( )[0] )
+
 def factory_reset( device_address, verbose ):
     tries = 0
     for path in ("/rpc/Shelly.FactoryReset","/settings/?reset=1"):
@@ -3310,23 +3358,25 @@ def validate_options( p, vars ):
     allow = { "help" : [ "what" ],
               "query" : [ "query_conditions", "query_columns", "group", "set_tag", "match_tag", "delete_tag", "refresh" ],
               "schema" : [ "query_conditions", "query_columns", "group", "match_tag", "refresh" ],
-              "apply" : [ "query_conditions", "query_columns", "group", "set_tag", "match_tag", "delete_tag", "ca_file", "server_key_file", "server_crt_file",
+              "apply" : [ "query_conditions", "query_columns", "group", "set_tag", "match_tag", "delete_tag", "ca_file", 
                           "ota", "apply_urls", "refresh", "delete_device", "restore_device", "dry_run", "settings", "access" ],
               "probe-list" : [ "query_conditions", "group", "refresh", "access" ],
               "provision-list" : [ "group", "ddwrt_name", "group", "cue", "timing", "ota", "print_using", "toggle", "wait_time", "settings", "keep_ap", 
-                                   "ca_file", "server_key_file", "server_crt_file" ],
-              "provision" : [ "ssid", "wait_time", "ota", "print_using", "toggle", "cue", "settings", "keep_ap", "ca_file", "server_key_file", "server_crt_file" ],
+                                   "ca_file" ],
+              "provision" : [ "ssid", "wait_time", "ota", "print_using", "toggle", "cue", "settings", "keep_ap", "ca_file" ],
               "acceptance-test" : [ "ssid" ],
               "config-test" : [ "ssid" ],
+              "identify" : [ "device_address", "device_id", "ca_file", "mqtt_server", "mqtt_user", "mqtt_password" ],
               "list" : [ "group" ],
               "clear-list" : [ ]
             }
 
     # required options for specific commands
     require = { "factory-reset" : [ "device_address" ],
-                "identify" : [ "device_address" ],
+                "reboot" : [ "device_address" ],
                 "flash" : [ "device_address", "ota" ],
                 "list-versions" : [ "device_address" ],
+                "put-ca" : [ "device_address", "ca_file" ],
                 "ddwrt-learn" : [ "ddwrt_name", "ddwrt_address", "ddwrt_password" ],
                 "import" : [ "file" ],
                 "replace" : [ "from_device", "to_device" ],
@@ -3371,7 +3421,7 @@ def validate_options( p, vars ):
 
 
 def main():
-    global init, wifi_connect, wifi_reconnect, get_cred, router_db, device_queue, device_db
+    global init, wifi_connect, wifi_reconnect, get_cred, router_db, device_queue, device_db, dev_gen
     p = argparse.ArgumentParser( description='Shelly configuration utility' )
     p.add_argument( '-w', '--time-to-wait', dest='wait_time', metavar='0', type=int, default=0, help='Time to wait on each pass looking for new devices, 0 for just once' )
     p.add_argument( '-s', '--ssid', dest='ssid', metavar='SSID', help='SSID of the current WiFi network, where devices are to be connected' )
@@ -3381,6 +3431,7 @@ def main():
     p.add_argument( '-V', '--version', action='version', version='version ' + version)
     p.add_argument( '-f', '--file', metavar='FILE', help='File to read/write using IMPORT or EXPORT operation' )
     p.add_argument( '-a', '--device-address',  metavar='TARGET-ADDRESS', help='Address or DNS name of target device' )
+    p.add_argument(       '--device-id',  metavar='TARGET-ID', help='ID of device (e.g. shellyplus1pm-b80922be71dc)' )
     p.add_argument(       '--ddwrt-name', '-N', action='append', metavar='NAME', help='Name of dd-wrt device' )
     p.add_argument( '-g', '--group',  metavar='GROUP', help='Group of devices to apply actions to (as defined in imported file)' )
     p.add_argument( '-e', '--ddwrt-address', metavar='IP-ADDRESS', help='IP address of dd-wrt device to use to configure target device' )
@@ -3411,9 +3462,12 @@ def main():
     p.add_argument(       '--keep-ap', action='store_true', help='Keep AP configured (on Plus devices)' )
     p.add_argument(       '--settings', help='Comma separated list of name=value settings for use with provision operation' )
     p.add_argument( '-G', '--force-generation', help='Force generation (1 or 2) of device(s) being provisioned' )
-    p.add_argument(       '--ca-file', type=FileType('r'), help='Path to UserCA file' )
-    p.add_argument(       '--server-key-file', type=FileType('r'), help='Path to server key file' )
-    p.add_argument(       '--server-crt-file', type=FileType('r'), help='Path to server crt file' )
+    p.add_argument(       '--ca-file', type=FileType('rb'), help='Path to UserCA file' )
+    p.add_argument(       '--server-key-file', type=FileType('rb'), help='Path to server key file' )
+    p.add_argument(       '--server-crt-file', type=FileType('rb'), help='Path to server crt file' )
+    p.add_argument(       '--mqtt-server', help='MQTT server address[:port]' )
+    p.add_argument(       '--mqtt-user', help='MQTT user' )
+    p.add_argument(       '--mqtt-password', help='MQTT password' )
     p.add_argument(       metavar='OPERATION', help='|'.join(all_operations), dest="operation", choices=all_operations )
 
     p.add_argument( dest='what', default=None, nargs='*' )
@@ -3431,6 +3485,9 @@ def main():
 
     new_version = None
 
+    if args.force_generation:
+        dev_gen = int(args.force_generation)
+
     if not args.access:
         if args.operation in ( 'query' ):
             args.access = 'ALL'
@@ -3441,12 +3498,16 @@ def main():
         help_docs( args.what )
         return
 
-    if ( args.ca_file or args.server_key_file or args.server_crt_file ) and ( not args.ca_file or not args.server_key_file or not args.server_crt_file ):
-        p.error( "All three options, --ca-file, --server-key-file, and --server-crt-file must be specified" )
-        return
-
     if args.operation == 'features':
         help_features( )
+        return
+
+    if args.operation == 'identify' and ((args.device_address and args.device_id) or (not args.device_address and not args.device_id)):
+        p.error( "Exactly one option --device-address or --device-id is required with the identify operation" )
+        return
+
+    if args.operation == 'identify' and args.device_id and not args.mqtt_server:
+        p.error( "--mqtt-server must be specified with indentify --device-id" )
         return
 
     if args.operation in [ 'ddwrt-learn' ] and args.ddwrt_name and len( args.ddwrt_name ) > 1:
@@ -3457,7 +3518,7 @@ def main():
         p.error( "the provision-list operation accepts no more than two --ddwrt-name (-N) options" )
         return
 
-    args.ca_text = args.ca_file.read() if args.ca_file else None
+    args.ca_text = args.ca_file.read().decode("ascii") if args.ca_file else None
 
     if args.force_platform:
         platform = args.force_platform
@@ -3546,6 +3607,10 @@ def main():
     elif args.operation == 'factory-reset':
         factory_reset( args.device_address, args.verbose )
 
+    elif args.operation == 'put-ca':
+        dev_gen=2
+        put_UserCA( args, args.device_address )
+
     elif args.operation == 'flash':
         flash_device( args.device_address, args.pause_time, args.verbose, args.ota, args.ota_timeout, new_version, args.dry_run )
 
@@ -3577,7 +3642,10 @@ def main():
         query( args, new_version )
 
     elif args.operation == 'identify':
-        identify( args.device_address )
+        identify( args )
+
+    elif args.operation == 'reboot':
+        reboot( args.device_address, args.verbose )
 
     elif args.operation == 'list-versions':
         list_versions( args.device_address, args.pause_time, args.verbose )
