@@ -134,6 +134,11 @@ import copy
 import socket
 
 try:
+    import openpyxl
+except:
+    pass
+
+try:
     import paho.mqtt.publish as publish
 except:
     pass
@@ -161,8 +166,9 @@ else:
 version = "1.0010"
 
 required_keys = [ 'SSID', 'Password' ]
-optional_keys = [ 'StaticIP', 'NetMask', 'Gateway', 'NameServer', 'Group', 'Label', 'ProbeIP', 'Tags', 'DeviceName', 'LatLng', 'TZ', 'Access', 'MQTTServer', 'MQTTUser', 'MQTTPassword', 'MQTTssl_ca' ]
-default_query_columns = [ 'type', 'Origin', 'IP', 'ID', 'fw', 'has_update', 'settings.name' ] 
+optional_keys = [ 'StaticIP', 'NetMask', 'Gateway', 'NameServer', 'Group', 'Label', 'ProbeIP', 'Tags', 'Division', 'Store',
+                 'Wan', 'DeviceName', 'LatLng', 'TZ', 'Access', 'MQTTServer', 'MQTTUser', 'MQTTPassword', 'MQTTssl_ca' ]
+default_query_columns = [ 'type', 'Origin', 'IP', 'ID', 'fw', 'has_update', 'settings.name']
 
 all_operations = ( 'help', 'features', 'provision', 'provision-list', 'factory-reset', 'flash', 'import', 'list', 'clear-list', 
                    'ddwrt-learn', 'print-sample', 'probe-list', 'query', 'schema', 'apply', 'identify', 'replace', 'list-versions',
@@ -1600,6 +1606,8 @@ def ddwrt_ssh_loopback( node, verbose = 0 ):
     dbg = tn.read_very_eager()
     if verbose > 2: print( b"(6)" + dbg )
 
+    node[ 'loopback' ] = True
+
 def ddwrt_get_multi_line_result( cn, cmd ):
     ( result, err ) = ddwrt_do_cmd( cn['conn'], cmd, cn['eot'] )
     if err != "":
@@ -1626,7 +1634,7 @@ def ddwrt_establish_connection( address, user, password, eot ):
     if password:
         tn.read_until( b"Password: " )
         tn.write( password.encode( 'ascii' ) + b"\n" )
-    cn = { 'conn' : tn, 'eot' : eot }
+    cn = { 'conn' : tn, 'eot' : eot, 'loopback' : False }
     ddwrt_sync_connection( cn, b"PS1="+eot+b"\\\\n;", 5 )
     return cn
 
@@ -1644,52 +1652,79 @@ def ddwrt_connect_to_known_router( ddwrt_name ):
     cn[ 'current_mode' ] = ddwrt_get_single_line_result( cn, "nvram get wl_mode" )
     return cn
 
+def ddwrt_reconnect( cn ):
+    new_cn = ddwrt_establish_connection( cn['router']['address'], 'root', cn['router']['password'], cn['eot'])
+    if cn['loopback']:
+        cn['conn'] = new_cn['conn']
+        ddwrt_ssh_loopback( cn )
+    else:
+        cn['conn'] = new_cn['conn']
+
 def ddwrt_apply( address, user, password ):
     data = { 'submit_button':'index', 'action':'ApplyTake' }
     http_post( 'http://' + address + '/apply.cgi', data, user, password, 'http://' + address + '/Management.asp' )
 
-def ddwrt_program_mode( cn, pgm, from_db, deletes=None, net_cfg = None ):
-    changing_lan_addr = False
+def ddwrt_program_mode( args, cn, pgm, from_db, deletes=None, net_cfg = None ):
+    retries = 3
+    if args.ddwrt_reconnect:
+        cn['conn'].close()
+        ddwrt_reconnect( cn )
 
-    for k in pgm.keys():
-        ddwrt_get_single_line_result( cn, "nvram set " + k + '="' + pgm[k] + '"' )
-    mode = pgm[ 'wl_mode' ]
-    for k in from_db:
-        ddwrt_get_single_line_result( cn, "nvram set " + k + '=' + cn[ 'router' ][ mode ][ k ] )
-    if deletes:
-        for k in deletes:
-            ddwrt_get_single_line_result( cn, "nvram unset " + k )
+    #chk = input("Close?> ")
+    #if chk and chk.upper() in ('Y','YES'):
+    #    cn['conn'].close()
 
-    if mode == 'ap' and cn['router']['ap'].get('NAT-capable'):
-        # assume for now, if NAT-capable, the LAN address is always changing.
-        changing_lan_addr = True
-        ( static_ip, netmask, gateway, nameserver ) = net_cfg
-        ddwrt_get_single_line_result( cn, "nvram set lan_ipaddr=" + gateway )
-        ddwrt_get_single_line_result( cn, "nvram set lan_netmask=" + netmask )
-        ddwrt_get_single_line_result( cn, "nvram set lan_gateway=" + gateway )
-        ddwrt_get_single_line_result( cn, "nvram set sv_localdns=" + nameserver )
-        ddwrt_get_single_line_result( cn, "nvram set action_service=index" )
-        ddwrt_get_single_line_result( cn, "nvram set forward_spec=provision:on:tcp:81\>" + static_ip + ":80" )
-        ddwrt_get_single_line_result( cn, "nvram set forwardspec_entries=1" )
+    device_txt = "dd-wrt device " + cn[ 'router' ][ 'name' ] + " at address " + cn[ 'router' ][ 'address' ]
+    done = False
+    while retries > 0:
+        try:
+            retries -= 1
+            changing_lan_addr = False
 
-    ddwrt_get_single_line_result( cn, "nvram commit 2>/dev/null" )
+            for k in pgm.keys():
+                ddwrt_get_single_line_result( cn, "nvram set " + k + '="' + pgm[k] + '"' )
+            mode = pgm[ 'wl_mode' ]
+            for k in from_db:
+                ddwrt_get_single_line_result( cn, "nvram set " + k + '=' + cn[ 'router' ][ mode ][ k ] )
+            if deletes:
+                for k in deletes:
+                    ddwrt_get_single_line_result( cn, "nvram unset " + k )
 
+            if mode == 'ap' and cn['router']['ap'].get('NAT-capable'):
+                # assume for now, if NAT-capable, the LAN address is always changing.
+                changing_lan_addr = True
+                ( static_ip, netmask, gateway, nameserver ) = net_cfg
+                ddwrt_get_single_line_result( cn, "nvram set lan_ipaddr=" + gateway )
+                ddwrt_get_single_line_result( cn, "nvram set lan_netmask=" + netmask )
+                ddwrt_get_single_line_result( cn, "nvram set lan_gateway=" + gateway )
+                ddwrt_get_single_line_result( cn, "nvram set sv_localdns=" + nameserver )
+                ddwrt_get_single_line_result( cn, "nvram set action_service=index" )
+                ddwrt_get_single_line_result( cn, "nvram set forward_spec=provision:on:tcp:81\>" + static_ip + ":80" )
+                ddwrt_get_single_line_result( cn, "nvram set forwardspec_entries=1" )
 
-    if cn[ 'current_mode' ] == mode and not changing_lan_addr:
-        ddwrt_get_multi_line_result( cn, "stopservice nas;stopservice wlconf 2>/dev/null;startservice wlconf 2>/dev/null;startservice nas" )
-    else:
-        cn[ 'current_mode' ] = mode
-        ddwrt_apply( cn[ 'router' ][ 'address' ], 'admin', cn[ 'router' ][ 'password' ] )
-        device_txt = "dd-wrt device " + cn[ 'router' ][ 'name' ] + " at address " + cn[ 'router' ][ 'address' ]
-        if changing_lan_addr:
-            print( "updating NAT settings on " + device_txt )
-        else:
-            print( "changing " + device_txt + " mode to " + mode + "... configuration sent, now waiting for dd-wrt to apply changes" )
-        time.sleep( 5 )
-        ddwrt_sync_connection( cn, b'', 20 )
-        ddwrt_get_single_line_result( cn, "wl radio off; wl radio on" )
+            ddwrt_get_single_line_result( cn, "nvram commit 2>/dev/null" )
 
-def ddwrt_set_ap_mode( cn, ssid, password, net_cfg ):
+            if cn[ 'current_mode' ] == mode and not changing_lan_addr:
+                ddwrt_get_multi_line_result( cn, "stopservice nas;stopservice wlconf 2>/dev/null;startservice wlconf 2>/dev/null;startservice nas" )
+            else:
+                cn[ 'current_mode' ] = mode
+                ddwrt_apply( cn[ 'router' ][ 'address' ], 'admin', cn[ 'router' ][ 'password' ] )
+                if changing_lan_addr:
+                    print( "updating NAT settings on " + device_txt )
+                else:
+                    print( "changing " + device_txt + " mode to " + mode + "... configuration sent, now waiting for dd-wrt to apply changes" )
+                time.sleep( 5 )
+                ddwrt_sync_connection( cn, b'', 20 )
+                ddwrt_get_single_line_result( cn, "wl radio off; wl radio on" )
+            done=True
+        except:
+            print("Attempting to reconnect to dd-wrt device " + device_txt )
+            ddwrt_reconnect( cn )
+        if done: return
+    print("Failure reconnecting to dd-wrt device " + device_txt + ". aborting")
+    sys.exit()
+
+def ddwrt_set_ap_mode( args, cn, ssid, password, net_cfg ):
     pgm = { 'pptp_use_dhcp' : '1',        'wl0_akm' : 'psk psk2',            'wl0_mode' : 'ap',            
             'wl0_nctrlsb' : 'none',       'wl0_security_mode' : 'psk psk2',  'wl0_ssid' : ssid,            
             'wl_ssid' : ssid,             'wl0_wpa_psk' : password,          'wl_mode' : 'ap',             
@@ -1705,9 +1740,9 @@ def ddwrt_set_ap_mode( cn, ssid, password, net_cfg ):
 
     from_db = [ 'wl0_hw_rxchain','wl0_hw_txchain','wan_hwaddr' ]
     deletes = [ 'wan_ipaddr_buf','wan_ipaddr_static','wan_netmask_static', 'wl0_vifs' ]
-    ddwrt_program_mode( cn, pgm, from_db, deletes, net_cfg )
+    ddwrt_program_mode( args, cn, pgm, from_db, deletes, net_cfg )
 
-def ddwrt_set_sta_mode( cn, ssid ):
+def ddwrt_set_sta_mode( args, cn, ssid ):
     pgm = { 'pptp_use_dhcp' : '0',        'wan_gateway' : '192.168.33.1',    'wan_ipaddr' : '192.168.33.10',                     
             'wan_ipaddr_static' : '..',   'wan_netmask' : '255.255.255.0',   'wan_netmask_static' : '..',                     
             'wan_proto' : 'static',       'wl0_akm' : 'disabled',            'wl0_mode' : 'sta',                     
@@ -1717,7 +1752,7 @@ def ddwrt_set_sta_mode( cn, ssid ):
           }
     from_db = [ 'sta_ifname','wl0_hw_rxchain','wl0_hw_txchain','wan_hwaddr' ]
     deletes = [ 'wl0_wpa_psk' ]
-    ddwrt_program_mode( cn, pgm, from_db, deletes )
+    ddwrt_program_mode( args, cn, pgm, from_db, deletes )
 
 def ddwrt_learn( ddwrt_name, ddwrt_address, ddwrt_password, ddwrt_file ):
     global router_db
@@ -1818,9 +1853,9 @@ def import_label_lib( print_using ):
         print( "The module " + print_using + " does not contain a function 'make_label()'." )
         sys.exit( )
 
-def print_label( dev_info ):
+def print_label( dev_info,printerName ):
     try:
-        labelprinting.make_label( dev_info )
+        labelprinting.make_label( dev_info,printerName )
     except:
         for i in range(3): print()
         print( "*******************************************" )
@@ -2000,7 +2035,7 @@ def set_wifi_post( address, ssid, pw, static_ip, ip_mask, gateway, nameserver ):
         gw = ( '"gw":"' + gateway + '", ') if gateway else ''
         dns = ( '"nameserver":"' + nameserver + '", ') if nameserver else ''
         params = '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta":{"ssid":"' + ssid + '", "pass":"' + pw + '", ' + \
-                 '"ipv4mode":"static", "netmask":"' + ip_mask + '", ' + gw + dns + '"ip":"' + static_ip + '", "enable": true, "status_ntf":false, "rpc_ntf":false}}}}'
+                 '"ipv4mode":"static", "netmask":"' + ip_mask + '", ' + gw + dns + '"ip":"' + static_ip + '", "enable": true}}}}'
     else:
         params = '{ "id":1, "src":"user_1", "method":"WiFi.SetConfig", "params":{"config":{"sta":{"ssid":"' + ssid + '", "pass":"' + pw + '", "enable": true}}}}'
     return ( 'http://' + address + '/rpc', params )
@@ -2025,7 +2060,7 @@ def get_val( d, n ):
 def set_MQTT_post( addr, rec ):
     cfg = rec[ 'ConfigInput' ]
     if get_val( cfg, 'MQTTServer' ):
-        params = '{ "id":1, "src":"user_1", "method":"MQTT.SetConfig", "params":{"config":{"enable": true, "server": ' + json_null( get_val( cfg, 'MQTTServer' ) ) + \
+        params = '{ "id":1, "src":"user_1", "method":"MQTT.SetConfig", "params":{"config":{"enable": true, "rpc_ntf": false, "status_ntf": false, "server": ' + json_null( get_val( cfg, 'MQTTServer' ) ) + \
                      ', "user": ' + json_null( get_val( cfg, 'MQTTUser' ) ) + \
                      ', "pass": ' + json_null( get_val( cfg, 'MQTTPassword' ) ) + \
                      ', "ssl_ca": ' + json_null( get_val( cfg, 'MQTTssl_ca' ) ) + \
@@ -2101,6 +2136,8 @@ def mqtt_toggle_device( args, server, user, password, cert, topic ):
     port = int(hostport[1]) if len(hostport) > 1 else 1883
     if not args.force_generation:
         dev_gen = 2 if "plus" in topic.lower() else 1
+    else :
+        dev_gen=2
     tls = None
     if cert:
         tls = {"ca_certs":cert.name}
@@ -2327,9 +2364,11 @@ def finish_up_device( device, devname, rec, operation, args, new_version, initia
     #if need_update:
             device_db[ initial_status['mac'] ] = rec
             write_json_file( args.device_db, device_db )
-
+    if args.file:
+        update_excel_with_deviceId(rec['ConfigInput']['DeviceName'], rec['ID'], args.file)
     if args.print_using: 
-        print_label( rec )
+        print("Records for printing: ", rec)
+        print_label( rec,args.printer )
 
     if args.toggle:
         try:
@@ -2934,7 +2973,8 @@ def provision_device( addr, tries, args, ssid, pw, net_cfg ):
 def gen2_json_rpc( verbose, url, data, append ):
     ## TODO: python2 compatibility
     req = {"data": data, "append": append}
-    requests.post(url, json=req, timeout=5)
+    reseiot=requests.post(url, json=req, timeout=5)
+    print(reseiot.json)
 
 def gen2_rpc( verbosity, txn ):
     ( req, data ) = txn
@@ -2957,7 +2997,9 @@ def set_MQTT( args, addr, rec ):
         gen2_rpc( args.verbose, set_MQTT_post( addr, rec ) )
 
 def put_UserCA( args, addr ):
-    if dev_gen == 3 and sys.version_info.major >= 3:   ## TODO: python2 compatibility (put_UserCA_post?)
+    print(dev_gen)
+    if dev_gen == 2 and sys.version_info.major >= 3:   ## TODO: python2 compatibility (put_UserCA_post?)
+        print(args.ca_text)
         pos = 0
         append=False
         while pos < len(args.ca_text):
@@ -3096,10 +3138,10 @@ def provision_ddwrt( args, new_version ):
                     # With different ddwrt devices, faster to pre-configure AP with the target SSID
                     if ap_node[ 'router' ][ 'et0macaddr' ] != sta_node[ 'router' ][ 'et0macaddr' ]:
                         # This is required to set the SSID, may or may not need to change modes
-                        ddwrt_set_ap_mode( ap_node, cfg[ 'SSID' ], cfg[ 'Password' ], get_net_cfg( args, cfg ) )
+                        ddwrt_set_ap_mode( args, ap_node, cfg[ 'SSID' ], cfg[ 'Password' ], get_net_cfg( args, cfg ) )
 
                     # do this each time, to connect to a new device (different SSID)
-                    ddwrt_set_sta_mode( sta_node, device_ssids[0] )
+                    ddwrt_set_sta_mode( args, sta_node, device_ssids[0] )
                     if args.timing: print( 'dd-wrt device configuration time: ', round( timeit.default_timer() - t1, 2 ) )
 
                     t1 = timeit.default_timer()
@@ -3130,7 +3172,7 @@ def provision_ddwrt( args, new_version ):
                 # If just one ddwrt device, then switch from sta back to AP now
                 if ap_node[ 'router' ][ 'et0macaddr' ] == sta_node[ 'router' ][ 'et0macaddr' ]:
                     t1 = timeit.default_timer()
-                    ddwrt_set_ap_mode( ap_node, cfg[ 'SSID' ], cfg[ 'Password' ], get_net_cfg( args, cfg ) )
+                    ddwrt_set_ap_mode( args, ap_node, cfg[ 'SSID' ], cfg[ 'Password' ], get_net_cfg( args, cfg ) )
                     if args.timing: print( 'dd-wrt device reconfig time: ', round( timeit.default_timer() - t1, 2 ) )
 
                 t1 = timeit.default_timer()
@@ -3352,7 +3394,8 @@ def validate_options( p, vars ):
 
     # options/parameters with defaults, or universally allowed
     always = [ 'access', 'operation', 'ddwrt_file', 'pause_time', 'ota_timeout', 'device_db', 
-               'prefix', 'device_queue', 'verbose', 'force_platform', 'force_generation' ]
+               'prefix', 'device_queue', 'verbose', 'force_platform', 'force_generation',
+               'ddwrt_reconnect' ]
 
     # options allowed with specific commands
     allow = { "help" : [ "what" ],
@@ -3361,9 +3404,9 @@ def validate_options( p, vars ):
               "apply" : [ "query_conditions", "query_columns", "group", "set_tag", "match_tag", "delete_tag", "ca_file", 
                           "ota", "apply_urls", "refresh", "delete_device", "restore_device", "dry_run", "settings", "access" ],
               "probe-list" : [ "query_conditions", "group", "refresh", "access" ],
-              "provision-list" : [ "group", "ddwrt_name", "group", "cue", "timing", "ota", "print_using", "toggle", "wait_time", "settings", "keep_ap", 
+              "provision-list" : [ "group", "ddwrt_name", "group", "cue", "timing", "ota", "print_using", "printer", "file", "toggle", "wait_time", "settings", "keep_ap", 
                                    "ca_file" ],
-              "provision" : [ "ssid", "wait_time", "ota", "print_using", "toggle", "cue", "settings", "keep_ap", "ca_file" ],
+              "provision" : [ "ssid", "wait_time", "ota", "print_using", "printer", "file","toggle", "cue", "settings", "keep_ap", "ca_file" ],
               "acceptance-test" : [ "ssid" ],
               "config-test" : [ "ssid" ],
               "identify" : [ "device_address", "device_id", "ca_file", "mqtt_server", "mqtt_user", "mqtt_password" ],
@@ -3380,7 +3423,7 @@ def validate_options( p, vars ):
                 "ddwrt-learn" : [ "ddwrt_name", "ddwrt_address", "ddwrt_password" ],
                 "import" : [ "file" ],
                 "replace" : [ "from_device", "to_device" ],
-                "print-sample" : [ "print_using" ]
+                "print-sample" : [ "print_using", "printer"]
               }
 
     if op != 'help' and vars[ 'what' ]:
@@ -3415,6 +3458,71 @@ def validate_options( p, vars ):
         print( "The option --" + required[ 0 ] + " is required with the " + op + " operation" )
         sys.exit()
 
+
+
+####################################################################################
+#   EIOT ENHANCEMENT :SHELLY_CONFIG_CELLS
+####################################################################################
+
+def import_excel(file, queue_file, overwrite=False):
+    """
+    Reads the provisoning list excel file and updates the device queue for the provisioning-list operation.
+    file : name of input excel file
+    """
+
+    global device_queue
+    try:
+        xlObject = openpyxl.load_workbook(file)
+        xlSheetObject = xlObject.active
+        headers = [c.value for c in next(
+            xlSheetObject.iter_rows(min_row=1, max_row=1))]
+        deviceQueueReader = list()
+        for row in xlSheetObject.iter_rows(min_row=2, values_only=True):
+            rowValueDict = dict()
+            rowIter = 0
+            for columnName in headers:
+                rowValueDict[columnName] = row[rowIter]
+                rowIter += 1
+
+            if rowValueDict["DeviceId"] is None:
+                deviceQueueReader.append(rowValueDict)
+        print("Adding following devices to device queue:\n", deviceQueueReader)
+        if overwrite:
+            device_queue = []
+        append_list(deviceQueueReader)
+        write_json_file(queue_file, device_queue)
+    except Exception as e:
+        print("Failed to read data from excel file: ", e)
+
+
+def update_excel_with_deviceId(deviceName, deviceId, file):
+    """
+    This function updates the excel sheet with device id w.r.t device name.
+    """
+    try:
+        xlObject=openpyxl.load_workbook("config.xlsx")
+        xlSheetObject=xlObject.active
+        headers=[c.value for c in next(
+            xlSheetObject.iter_rows(min_row=1, max_row=1))]
+        if "DeviceId" in headers and "DeviceName" in headers:
+            deviceIdIndex=headers.index("DeviceId")
+            deviceNameIndex=headers.index("DeviceName")
+            deviceQueueReader=list()
+            deviceNamesXlFile=[row[deviceNameIndex] for row in xlSheetObject.iter_rows(
+                min_row=2, values_only=True)]
+            xlSheetObject.cell(row=deviceNamesXlFile.index(
+                deviceName)+2, column=deviceIdIndex+1).value=deviceId
+            print(deviceNamesXlFile, "device found at ",
+                  deviceNamesXlFile.index(deviceName)+1, deviceIdIndex+1)
+            xlObject.save("config.xlsx")
+        else:
+            print("Device Name or Device Id Column is not present in Excel file.\nFound Columns in input excel file:\n", headers)
+            raise
+
+    except:
+        print("Error in writing device id to excel file")
+
+
 ####################################################################################
 #   Main
 ####################################################################################
@@ -3442,6 +3550,7 @@ def main():
     p.add_argument(       '--toggle', action='store_true', help='Toggle relay on devices after each is provisioned' )
     p.add_argument(       '--device-queue', default='provisionlist.json', help='Location of json database of devices to be provisioned with provision-list' )
     p.add_argument(       '--ddwrt-file', default='ddwrt_db.json', help='File to keep ddwrt definitions' )
+    p.add_argument(       '--printer', default='', help='Name of label printer')
     p.add_argument(       '--print-using', metavar='PYTHON-FILE', help='Python program file containing a function, "make_label", for labeling provisioned devices' )
     p.add_argument(       '--device-db', default='iot-devices.json', help='Device database file (default: iot-devices.json)' )
     p.add_argument(       '--ota', dest='ota', metavar='http://...|LATEST', default='', help='OTA firmware to update after provisioning, or with "flash" or "apply" operation' )
@@ -3459,6 +3568,7 @@ def main():
     p.add_argument(       '--from-device', metavar='DEVICE-ID', help='Device db entry from which to copy settings using the replace operation' )
     p.add_argument(       '--to-device', metavar='DEVICE-ID', help='Device db entry to receive the copy of settings using the replace operation' )
     p.add_argument(       '--dry-run', action='store_true', help='Display urls to apply instead of performing --restore or --settings' )
+    p.add_argument(       '--ddwrt-reconnect', action='store_true', help='Force telnet disconnect to dd-wrt device when reconfiguring' )
     p.add_argument(       '--keep-ap', action='store_true', help='Keep AP configured (on Plus devices)' )
     p.add_argument(       '--settings', help='Comma separated list of name=value settings for use with provision operation' )
     p.add_argument( '-G', '--force-generation', help='Force generation (1 or 2) of device(s) being provisioned' )
@@ -3469,7 +3579,6 @@ def main():
     p.add_argument(       '--mqtt-user', help='MQTT user' )
     p.add_argument(       '--mqtt-password', help='MQTT password' )
     p.add_argument(       metavar='OPERATION', help='|'.join(all_operations), dest="operation", choices=all_operations )
-
     p.add_argument( dest='what', default=None, nargs='*' )
 
     try:
@@ -3579,8 +3688,12 @@ def main():
             return
         if args.file.lower().endswith('.json'):
             import_json( args.file, args.device_queue )
+        elif args.file.lower().endswith('.csv'):
+            import_csv(args.file, args.device_queue)
+        elif args.file.lower().endswith('.xlsx'):
+            import_excel(args.file, args.device_queue, True)
         else:
-            import_csv( args.file, args.device_queue )
+            print("Unsupported file format : Supported file formats are .csv, .json, .xlsx")
 
     elif args.operation == 'acceptance-test':
         init( )
