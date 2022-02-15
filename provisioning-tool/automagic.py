@@ -24,6 +24,8 @@
 #
 #  Changes:
 #
+# 1.1003     Added Excel features, clarified some documentation, added telnet reconnection
+#
 # 1.1002     Added reboot and put-ca features, finished work on MQTTS and CA
 #
 # 1.1001     MQTTS and CA features added
@@ -163,7 +165,7 @@ else:
     from StringIO import StringIO
     from urllib2 import HTTPError
 
-version = "1.0010"
+version = "1.1003"
 
 required_keys = [ 'SSID', 'Password' ]
 optional_keys = [ 'StaticIP', 'NetMask', 'Gateway', 'NameServer', 'Group', 'Label', 'ProbeIP', 'Tags', 'Division', 'Store',
@@ -454,17 +456,17 @@ def help_ddwrt_learn( more = None ):
                  provisioning options.  This has been tested with Broadcom-based (Linksys) routers.
 
                  (1) Connect a DD-WRT device configured in client mode, and connected to your LAN to any of its LAN ports. Client mode
-                 is selected in the Wireless/Basic settings screen.  Disable DHCP server, enable telnet and ssh. Use the username "admin" 
-                 and choose a password you are okay with storing in plaintext for use by this program. In the DD-WRT setup section 
-                 "WAN Setup" / "WAN Connection Type", Set "Connection Type" to "Disabled."  In the "Network Setup" / "Router IP" section,
-                 set up an address on your local subnet.
+                 is selected in the Wireless/Basic settings screen.  In the Services tab, disable DHCP server, enable telnet and ssh. 
+                 Use the username "admin" and choose a password you are okay with storing in plaintext for use by this program. 
+                 In the DD-WRT setup section "WAN Setup" / "WAN Connection Type", Set "Connection Type" to "Static," and set the wan 
+                 address to 192.168.33.10, gateway to 192.168.33.1, and subnet mask 255.255.255.0.  In the "Network Setup" / "Router IP" 
+                 section, set up an address on your local subnet.
 
                  IMPORTANT: On setup page, disable DHCP, enable forced DNS redirection, and on Services page, disable Dnsmasq entirely.
 
                  When the device is configured, run ddwrt-learn.
 
                       ex: python automagic.py ddwrt-learn -N sh1 -p all4shelly -e <DD-WRT device address>
-
 
                  (2A) For standard use (programming IoT devices in DHCP mode, or static IP addresses all matching the router and subnet of
                  your existing LAN), re-learn the same DD-WRT device (or better, a second device, with the same settings as above), but change 
@@ -473,7 +475,9 @@ def help_ddwrt_learn( more = None ):
                  (2B) ALTERNATIVE -- If you want to be able to provision multiple IoT devices with static addresses and with each with
                  a different subnet/router, you will need to attach a second DD-WRT device (not the one learned in step 1) to your LAN, this
                  time connecting its WAN port to your LAN. On this device, you will leave DHCP enabled, and the WAN Connection will be set to
-                 static. Choose your router's address and a free IP address in your static address range. Enable telnet and ssh access, as well
+                 static.  In the DD-WRT setup section "WAN Setup" / "WAN Connection Type", Set "Connection Type" to "Static," and set the wan 
+                 address to a free address on your local LAN, with approprate gateway, subnet mask and DNS server settings.  The settings in
+                 the "Network Setup" / "Router IP" section will be automatically controlled by the script. Enable telnet and ssh access, as well
                  as web, telnet and ssh remote access, in the Administration/Management screen. Use the username "admin" and choose a password 
                  you are okay with storing in plaintext for use by this program.
 
@@ -2129,7 +2133,7 @@ def get_toggle_url( ip, dev_type ):
 
 def mqtt_toggle_device( args, server, user, password, cert, topic ):
     if 'publish' not in globals():
-        print( 'use pip/pip2 to install MQTT library "paho"')
+        print( 'use pip/pip3 to install MQTT library "paho"')
         return;
     hostport = server.split(':')
     host = hostport[0]
@@ -3469,6 +3473,10 @@ def import_excel(file, queue_file, overwrite=False):
     Reads the provisoning list excel file and updates the device queue for the provisioning-list operation.
     file : name of input excel file
     """
+
+    if 'openpyxl' not in globals():
+        print( 'use pip/pip3 to install excel format library "openpyxl"')
+        sys.exit()
 
     global device_queue
     try:
