@@ -1857,9 +1857,9 @@ def import_label_lib( print_using ):
         print( "The module " + print_using + " does not contain a function 'make_label()'." )
         sys.exit( )
 
-def print_label( dev_info,printerName ):
+def print_label( dev_info, printerName ):
     try:
-        labelprinting.make_label( dev_info,printerName )
+        labelprinting.make_label( dev_info, printerName )
     except:
         for i in range(3): print()
         print( "*******************************************" )
@@ -1869,7 +1869,7 @@ def print_label( dev_info,printerName ):
         for i in range(3): print()
         raise
 
-def test_print( ):
+def test_print( args ):
     dev_info = {
             "Group": "foo",
             "Brand": "Shelly",
@@ -1931,7 +1931,7 @@ def test_print( ):
                 }
             }
         }
-    print_label( dev_info )
+    print_label( dev_info, args.printer )
 
 ####################################################################################
 #   HTTP / network Utilities
@@ -2372,7 +2372,7 @@ def finish_up_device( device, devname, rec, operation, args, new_version, initia
         update_excel_with_deviceId(rec['ConfigInput']['DeviceName'], rec['ID'], args.file)
     if args.print_using: 
         print("Records for printing: ", rec)
-        print_label( rec,args.printer )
+        print_label( rec, args.printer )
 
     if args.toggle:
         try:
@@ -3415,7 +3415,8 @@ def validate_options( p, vars ):
               "config-test" : [ "ssid" ],
               "identify" : [ "device_address", "device_id", "ca_file", "mqtt_server", "mqtt_user", "mqtt_password" ],
               "list" : [ "group" ],
-              "clear-list" : [ ]
+              "clear-list" : [ ],
+                "print-sample" : [ "printer" ]
             }
 
     # required options for specific commands
@@ -3427,7 +3428,7 @@ def validate_options( p, vars ):
                 "ddwrt-learn" : [ "ddwrt_name", "ddwrt_address", "ddwrt_password" ],
                 "import" : [ "file" ],
                 "replace" : [ "from_device", "to_device" ],
-                "print-sample" : [ "print_using", "printer"]
+                "print-sample" : [ "print_using" ]
               }
 
     if op != 'help' and vars[ 'what' ]:
@@ -3751,7 +3752,7 @@ def main():
         clear_list( args.device_queue )
 
     elif args.operation == 'print-sample':
-         test_print( )
+         test_print( args )
 
     elif args.operation in ( 'probe-list' ):
         probe_list( args )
