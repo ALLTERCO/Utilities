@@ -101,7 +101,7 @@
 #            Simplify some python2/3 compatibility per: http://python-future.org/compatible_idioms.html
 #            DeviceType -- limit provision-list to matching records -- provision-list to choose devices by DeviceType
 #            -U option to apply operation to make arbitrary updates in device DB (for use prior to restore)
-#            --parallel=<n>  batched parallel firmware updating, n at a time, pausing between batches, or exiting if no more
+#            make parallel take a limit: --parallel=<n>  batched parallel firmware updating, n at a time, pausing between batches
 #            --group for "provision" -- add to group
 #            --prompt n,n,n  for use with "provision" to prompt for v,v,v giving individual values like StaticIP
 #
@@ -2092,7 +2092,7 @@ def get_settings_url( address, rec = None ):
     if dev_gen == 2:
          return "http://" + address + "/rpc/Sys.GetConfig"
     else:
-         return "http://" + address + "/settings" + q
+         return "http://" + address + "/settings"
 
 def set_settings_url( address, rec = None ):
     if dev_gen == 2:
@@ -2361,7 +2361,9 @@ def finish_up_device( device, devname, rec, operation, args, new_version, initia
         set_MQTT( args, device, rec )
 
     if args.ota != '':
-        if flash_device( device, args.pause_time, args.verbose, args.ota, args.ota_timeout, new_version, args.dry_run ):
+        old_version = flash_device( device, args.pause_time, args.verbose, args.ota, new_version, args.dry_run )
+        if old_version:
+            wait_for_flash_completion( device, args.pause_time, args.verbose, args.ota, args.ota_timeout, old_version, new_version, args.dry_run )
     #        need_update = True
             new_status = get_status( device, args.pause_time, args.verbose )
             rec['status'] = new_status if new_status else {}
@@ -2459,11 +2461,13 @@ def flatten( d, prefix='', devtype = None ):
         result = { prefix : str( d ) }
     return [ result, guide ]
 
-def match_rec( rec, query_conditions, match_tag, group, restore_device, access ):
+def match_rec( rec, query_conditions, match_tag, no_tag, group, restore_device, access ):
     for q in query_conditions:
         if q[0] not in rec or rec[q[0]] != q[1]:
             return False
     if match_tag and ( 'Tags' not in rec or match_tag not in rec['Tags'].split(',') ):
+        return False
+    if no_tag and ( 'Tags' in rec and no_tag in rec['Tags'].split(',') ):
         return False
     if group and ( not 'Group' in rec or rec[ 'Group' ] != group ):
         return False
@@ -2508,7 +2512,7 @@ def print_details( col, paths, verbosity, max_width ):
 #   Operations
 ####################################################################################
 
-def flash_device( addr, pause_time, verbose, ota, ota_timeout, new_version, dry_run ):
+def flash_device( addr, pause_time, verbose, ota, new_version, dry_run ):
     global ota_version_cache
     print( "Checking old firmware version" )
     url = "http://" + addr + "/ota"
@@ -2528,54 +2532,58 @@ def flash_device( addr, pause_time, verbose, ota, ota_timeout, new_version, dry_
         new_version = ota_version_cache[ 'data' ][ dev_type ][ 'version' ]
     if result['old_version'] == new_version:
         print( "Device is already up-to-date" )
-        return True
+        return False
     if result['status'] == 'updating':
         print( 'Error: Device already shows "updating"' )
         return False
     if ota_flash( addr, pause_time, ota, verbose, dry_run ):
         print( "Sent OTA instructions to " + addr )
         print( "New version: " + new_version )
-        if ota_timeout == 0: return True
-        print( "Pausing to wait to check for successful OTA flash..." )
-        start_time = time.time( )
-        seen_updating = False
-        passes = 0
-        while time.time( ) < start_time + ota_timeout:
-            passes += 1
-            time.sleep( pause_time )
-            new_result = get_url( addr, pause_time, verbose, url, '' )
-            if not new_result: return False
-            if new_result['status'] == 'updating': 
-                if seen_updating:
-                    print( '.', end='' )
-                    sys.stdout.flush( )
-                else:
-                    print( "status: " + new_result['status'] + ", version: " + new_result['old_version'] )
-                seen_updating = True
-            elif seen_updating:
-                if not new_version or result['old_version'] != new_result['old_version']:
-                    if not new_version or new_result['old_version'] == new_version:
-                        print( "" )
-                        print( "Success. Device " + addr + " updated from " + result['old_version'] + ' to ' + new_result['old_version'] )
-                        return True
-                    else:
-                        print(repr(new_version))
-                        fail_msg( "****possible OTA failure***  Device " + addr + ' still has unexpected build, not matching manifest: ' + new_result['old_version'] )
-                        return False
-                else:
-                    break
-            else:
-                if passes > 10:
-                    print( 'The device ' + addr + ' has never shown status "updating". Is it already on the version requested? ' )
-                    return False
-                print( "status: " + new_result['status'] + ", version: " + new_result['old_version'] )
-        fail_msg( "****possible OTA failure***  Device " + addr + ' still has ' + new_result['old_version'] )
-        return False
-
     else:
         if not dry_run: print( "Could not flash firmware to device " + addr )
         return False
-    return True
+    if dry_run:
+        return False
+    return result[ 'old_version' ]
+
+def wait_for_flash_completion( addr, pause_time, verbose, ota_timeout, old_version, new_version ):
+    if ota_timeout == 0: return True
+    url = "http://" + addr + "/ota"
+    print( "Pausing to wait to check for successful OTA flash..." )
+    start_time = time.time( )
+    seen_updating = False
+    passes = 0
+    while time.time( ) < start_time + ota_timeout:
+        passes += 1
+        time.sleep( pause_time )
+        new_result = get_url( addr, pause_time, verbose, url, '' )
+        if not new_result: return False
+        if new_result['status'] == 'updating': 
+            if seen_updating:
+                print( '.', end='' )
+                sys.stdout.flush( )
+            else:
+                print( "status: " + new_result['status'] + ", version: " + new_result['old_version'] )
+            seen_updating = True
+        elif seen_updating:
+            if not new_version or old_version != new_result['old_version']:
+                if not new_version or new_result['old_version'] == new_version:
+                    print( "" )
+                    print( "Success. Device " + addr + " updated from " + old_version + ' to ' + new_result['old_version'] )
+                    return True
+                else:
+                    print(repr(new_version))
+                    fail_msg( "****possible OTA failure***  Device " + addr + ' still has unexpected build, not matching manifest: ' + new_result['old_version'] )
+                    return False
+            else:
+                break
+        else:
+            if passes > 10:
+                print( 'The device ' + addr + ' has never shown status "updating". Is it already on the version requested? ' )
+                return False
+            print( "status: " + new_result['status'] + ", version: " + new_result['old_version'] )
+    fail_msg( "****possible OTA failure***  Device " + addr + ' still has ' + new_result['old_version'] )
+    return False
 
 def schema( args ):
     query_columns = args.query_columns.split(',') if args.query_columns else []
@@ -2589,7 +2597,7 @@ def schema( args ):
         if d == 'Format':
             continue
         ( data, new_guide ) = flatten( device_db[ d ] )
-        if match_rec( data, query_conditions, args.match_tag, args.group, None, args.access ):
+        if match_rec( data, query_conditions, args.match_tag, args.no_tag, args.group, None, args.access ):
             u.update( data )
             guide = deep_update( new_guide, guide )
     k = sorted( u.keys() )
@@ -2616,9 +2624,15 @@ def schema( args ):
 
 def apply( args, new_version, data, need_write ):
     configured_settings = None
+    flashed = False
+    old_version = ""
 
     if args.ota != '':
-        flash_device( data[ 'IP' ], args.pause_time, args.verbose, args.ota, args.ota_timeout, new_version, args.dry_run )
+        old_version = flash_device( data[ 'IP' ], args.pause_time, args.verbose, args.ota, new_version, args.dry_run )
+        if old_version:
+            flashed = True
+            if not args.parallel:
+                wait_for_flash_completion( data[ 'IP' ], args.pause_time, args.verbose, args.ota_timeout, old_version, new_version )
 
     if args.apply_urls:
         for url in args.apply_urls:
@@ -2709,7 +2723,7 @@ def apply( args, new_version, data, need_write ):
              configured_settings = get_url( data[ 'IP' ], args.pause_time, args.verbose, get_settings_url( data[ 'IP' ] ), 'to get config' )
              need_write = 1
 
-    return( configured_settings, need_write )
+    return( configured_settings, need_write, flashed, old_version )
 
 def query( args, new_version = None ):
     global device_db
@@ -2737,6 +2751,10 @@ def query( args, new_version = None ):
         ( data, new_guide ) = flatten( device_db[ d ] )
         guide.update( new_guide )
         tmp.append( data )
+
+    if len(tmp) == 0:
+        print("device db is empty")
+        return
 
     column_map = {}
     for q in query_columns:
@@ -2773,7 +2791,7 @@ def query( args, new_version = None ):
     continuous_count = 0
     total_count = 0
     for ( res, data ) in results:
-        if match_rec( data, query_conditions, args.match_tag, args.group, args.restore_device, args.access ):
+        if match_rec( data, query_conditions, args.match_tag, args.no_tag, args.group, args.restore_device, args.access ):
             if args.set_tag or args.delete_tag:
                 need_write = True
                 old_tags = data['Tags'].split(',') if 'Tags' in data and data['Tags'] != '' else []
@@ -2800,6 +2818,9 @@ def query( args, new_version = None ):
 
     if args.operation == 'apply':
         print( )
+        if args.parallel and ( args.apply_urls or args.settings or args.restore_device or not args.ota ) :
+            print( "The --parallel option works only with --ota" )
+            return
         if nogo:
             print( "These devices have no stored IP. No changes will be applied." )
             for (result, res, data) in nogo:
@@ -2810,6 +2831,7 @@ def query( args, new_version = None ):
             print( "Applying changes..." )
 
         done = []
+        wait_queue = [ ]
         passes = 0
         configured_settings = None
         while( todo ):
@@ -2818,11 +2840,16 @@ def query( args, new_version = None ):
                 if find_device( data ):
                     done.append( [ result, res, data ] )
                     if not args.dry_run: print( data[ 'IP' ] )
-                    ( configured_settings, need_write ) = apply( args, new_version, data, need_write )
+                    ( configured_settings, need_write, flashed, old_version ) = apply( args, new_version, data, need_write )
+                    if configured_settings:
+                        device_db[ data[ 'ID' ] ][ 'settings' ] = configured_settings
+                    if flashed:
+                        data[ 'old_version' ] = old_version
+                        wait_queue.append( data )
                     total_count -= 1
                     if 'Access' not in data or data[ 'Access' ] == 'Continuous':
                         continuous_count -= 1
-                        
+
                         if continuous_count == 0 and total_count > 0:
                            print( )
                            print( "Only Periodic WiFi-connected devices remain. Polling until they are found..." )
@@ -2839,11 +2866,13 @@ def query( args, new_version = None ):
             if todo:
                 time.sleep(.5)
 
-        if configured_settings:
-            device_db[ data[ 'ID' ] ][ 'settings' ] = configured_settings
-
     if need_write:
         write_json_file( args.device_db, device_db )
+
+    if args.parallel and args.ota and len( wait_queue ) > 0:
+        print( "Now waiting for completion of parallel OTA flash" )
+        for data in wait_queue:
+            wait_for_flash_completion( data[ 'IP' ], args.pause_time, args.verbose, args.ota_timeout, data[ 'old_version' ], new_version )
 
 def probe_list( args ):
     query_conditions = [ x.split('=') for x in args.query_conditions.split(',') ] if args.query_conditions else []
@@ -2855,8 +2884,10 @@ def probe_list( args ):
 
     todo = []
     for rec in dq:
-        if match_rec( rec, query_conditions, args.match_tag, args.group, None, args.access ) and 'ProbeIP' in rec['ConfigInput']: 
+        if match_rec( rec, query_conditions, args.match_tag, args.no_tag, args.group, None, args.access ) and 'ProbeIP' in rec['ConfigInput']: 
             todo.append( rec )
+    if len( todo ) == 0:
+        print( "No devices in list found with ProbeIP" )
 
     if not args.refresh:
         check_for_device_queue( todo, args.group, True )
@@ -3403,10 +3434,10 @@ def validate_options( p, vars ):
 
     # options allowed with specific commands
     allow = { "help" : [ "what" ],
-              "query" : [ "query_conditions", "query_columns", "group", "set_tag", "match_tag", "delete_tag", "refresh" ],
-              "schema" : [ "query_conditions", "query_columns", "group", "match_tag", "refresh" ],
-              "apply" : [ "query_conditions", "query_columns", "group", "set_tag", "match_tag", "delete_tag", "ca_file", 
-                          "ota", "apply_urls", "refresh", "delete_device", "restore_device", "dry_run", "settings", "access" ],
+              "query" : [ "query_conditions", "query_columns", "group", "set_tag", "match_tag", "no_tag", "delete_tag", "refresh" ],
+              "schema" : [ "query_conditions", "query_columns", "group", "match_tag", "no_tag", "refresh" ],
+              "apply" : [ "query_conditions", "query_columns", "group", "set_tag", "match_tag", "no_tag", "delete_tag", "ca_file", 
+                          "ota", "apply_urls", "refresh", "delete_device", "restore_device", "dry_run", "settings", "access", "parallel" ],
               "probe-list" : [ "query_conditions", "group", "refresh", "access" ],
               "provision-list" : [ "group", "ddwrt_name", "group", "cue", "timing", "ota", "print_using", "printer", "file", "toggle", "wait_time", "settings", "keep_ap", 
                                    "ca_file" ],
@@ -3557,6 +3588,7 @@ def main():
     p.add_argument( '-r', '--refresh', action='store_true', help='Refresh the db with attributes probed from device before completing operation' )
     p.add_argument(       '--access', default=None, help='Restrict apply and probe operations to Continuous, Periodic, or ALL devices', choices=['ALL','Continuous','Periodic'] )
     p.add_argument(       '--toggle', action='store_true', help='Toggle relay on devices after each is provisioned' )
+    p.add_argument(       '--parallel', action='store_true', help='Enable parallel OTA flash programming, with the "apply" command' )
     p.add_argument(       '--device-queue', default='provisionlist.json', help='Location of json database of devices to be provisioned with provision-list' )
     p.add_argument(       '--ddwrt-file', default='ddwrt_db.json', help='File to keep ddwrt definitions' )
     p.add_argument(       '--printer', default='', help='Name of label printer')
@@ -3570,6 +3602,7 @@ def main():
     p.add_argument( '-q', '--query-columns', help='Comma separated list of columns to output, start with "+" to also include all default columns, "-" to exclude specific defaults' )
     p.add_argument( '-Q', '--query-conditions', help='Comma separated list of name=value selectors' )
     p.add_argument( '-t', '--match-tag', help='Tag to limit query and apply operations' )
+    p.add_argument( '-x', '--no-tag', help='Exclude tag to limit query and apply operations' )
     p.add_argument( '-T', '--set-tag', help='Tag results of query operation' )
     p.add_argument(       '--delete-tag', help='Remove tag from results of query operation' )
     p.add_argument(       '--delete-device', metavar='DEVICE-ID|ALL', help='Remove device from device-db' )
@@ -3734,7 +3767,9 @@ def main():
         put_UserCA( args, args.device_address )
 
     elif args.operation == 'flash':
-        flash_device( args.device_address, args.pause_time, args.verbose, args.ota, args.ota_timeout, new_version, args.dry_run )
+        old_version = flash_device( args.device_address, args.pause_time, args.verbose, args.ota, new_version, args.dry_run )
+        if old_version:
+            wait_for_flash_completion( args.device_address, args.pause_time, args.verbose, args.ota_timeout, old_version, new_version )
 
     elif args.operation == 'ddwrt-learn':
         ddwrt_learn( args.ddwrt_name[0], args.ddwrt_address, args.ddwrt_password, args.ddwrt_file )
