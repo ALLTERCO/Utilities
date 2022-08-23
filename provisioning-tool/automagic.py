@@ -2098,7 +2098,7 @@ def set_settings_url( address, rec = None ):
     if dev_gen == 2:
          #TODO-KBC - dst stuff?
          return "http://" + address + "/rpc/Sys.GetConfig"
-    else:
+    elif 'ConfigInput' in rec:
          map = { "DeviceName" : "name", "LatLng" : "lat:lng", "TZ" : "tz_dst:tz_dst_auto:tz_utc_offset:tzautodetect" }
          parms = {}
          if rec:
@@ -2108,7 +2108,9 @@ def set_settings_url( address, rec = None ):
                      for elem in zip( map[ tag ].split(':'), cfg[ tag ].split(':') ):
                          parms[ elem[ 0 ]  ] = elem[ 1 ]
          q = "?" + url_encode( parms ) if parms else ""
-         return "http://" + address + "/settings" + q
+    else:
+         q = ""
+    return "http://" + address + "/settings" + q
 
 def ota_url( addr, fw ):
     if fw == 'LATEST':
