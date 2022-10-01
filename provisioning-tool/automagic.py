@@ -1947,7 +1947,9 @@ def any_timeout_reason( e ):
     return isinstance( e, socket.timeout ) or \
            'reason' in dir( e ) and ( isinstance( e.reason, socket.timeout ) or \
                 str( e.reason ) in (
+                    'Not Found',
                     '[Errno 64] Host is down',
+                    '[Errno 65] No route to host',
                     'urlopen error [Errno 8] nodename nor servname provided, or not known',
                     '[Errno 61] Connection refused',
                     'urlopen error timed out' ) )
@@ -2901,34 +2903,46 @@ def probe_list( args ):
     probe_count = 1
     need_write = False
     # todo: Look for Periodic-type devices in queue and message that it might take a while
-    while len( todo ):
+    while len( [ x for x in todo if 'Done' not in x ] ):
         if args.operation == 'probe-list' and not args.verbose:
             sys.stdout.write( "." )
             sys.stdout.flush()
         for rec in todo:
+            if 'Tries' not in rec: rec[ 'Tries' ] = 0
             cfg = rec[ 'ConfigInput' ]
+            if 'DeviceName' not in cfg: cfg[ 'DeviceName' ] = ''
             if need_write and ( probe_count % 10 == 0 or 'Access' in cfg and cfg[ 'Access' ] == 'Periodic' ):
                 write_json_file( args.device_db, device_db )
+            rec[ 'Tries' ] += 1
             initial_status = None
             try:
                 initial_status = json.loads( url_read( status_url( cfg[ 'ProbeIP' ] ), tmout = 0.5 ) )
                 break
             except BaseException as e:
                 if any_timeout_reason( e ):
-                    pass
+                    if args.operation == 'probe-list' and args.verbose:
+                        if 'reason' in dir( e ):
+                            eprint( "Continuing after:", str( e.reason ), cfg['ProbeIP'], cfg['DeviceName'], rec['Tries'] )
+                        else:
+                            eprint( "Continuing after timeout" )
                 else:
-                    eprint( "Unexpected error [A]:", str( e.reason ) )  ### sys.exc_info( )[0] )
+                    if 'reason' in dir( e ):
+                        eprint( "Unexpected error [A]:", str( e.reason ) )  ### sys.exc_info( )[0] )
                     sys.exit()
         if initial_status:
-             done.append( rec )
-             complete_probe( args, rec, initial_status )
-             need_write = True
-             probe_count += 1
+            done.append( rec )
+            complete_probe( args, rec, initial_status )
+            need_write = True
+            probe_count += 1
         time.sleep( 0.5 )
         todo = [ r for r in todo if r not in done ]
+        if args.operation == 'probe-list':
+            write_json_file( args.device_queue, todo )
 
     if need_write:
         write_json_file( args.device_db, device_db )
+        if args.operation == 'probe-list':
+            write_json_file( args.device_queue, todo )
 
 def acceptance_test( args, credentials ):
     prior_ssids = {}
