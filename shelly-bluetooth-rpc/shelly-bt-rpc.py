@@ -60,13 +60,13 @@ async def call(
     }
     if resp:
         req["id"] = random.randint(1, 1000000000)
-    reqJSON = json.dumps(req)
-    reqLen = len(reqJSON)
-    logging.debug(f"Request: {reqJSON}")
-    logging.debug(f"Writing length ({reqLen})...")
-    await client.write_gatt_char(tx_ctl_char, struct.pack(">I", reqLen), response=True)
+    req_json = json.dumps(req).encode("utf-8")
+    req_len = len(req_json)
+    logging.debug(f"Request: {req_json}")
+    logging.debug(f"Writing length ({req_len})...")
+    await client.write_gatt_char(tx_ctl_char, struct.pack(">I", req_len), response=True)
     logging.debug(f"Sending request...")
-    await client.write_gatt_char(data_char, reqJSON.encode("ascii"), response=True)
+    await client.write_gatt_char(data_char, req_json, response=True)
     while True:
         raw_rx_frame = await client.read_gatt_char(rx_ctl_char)
         frame_len = struct.unpack(">I", raw_rx_frame)[0]
@@ -79,12 +79,12 @@ async def call(
             chunk = await client.read_gatt_char(data_char)
             frame_data += chunk
             n_chunks += 1
-        logging.debug(f"RX Frame data (rec'd in {n_chunks} chunks): {frame_data}")
+        logging.debug(f"RX Frame data (rec'd in {n_chunks} chunks): {frame_data!r}")
         frame = json.loads(frame_data)
         if frame.get("id", 0) != req["id"]:
             continue
         if "result" in frame:
-            print(json.dumps(frame["result"], indent=2))
+            print(json.dumps(frame["result"], ensure_ascii=False, indent=2))
             sys.exit(0)
         elif "error" in frame:
             print(json.dumps(frame["error"], indent=2))
@@ -120,11 +120,14 @@ async def main():
         level=args.v,
         format="[%(asctime)s %(levelno)d] %(message)s",
         datefmt="%Y/%m/%d %H:%M:%S",
+        stream=sys.stderr,
     )
 
     if args.action == "scan":
+
         def cb(device: BLEDevice, adv: AdvertisementData) -> None:
             print(f"{device.address} {device.rssi} {device.name or '?'}")
+
         async with BleakScanner(cb):
             await asyncio.sleep(args.time)
         return
