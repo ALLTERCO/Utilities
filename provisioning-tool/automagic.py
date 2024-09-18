@@ -2289,9 +2289,10 @@ def complete_probe( args, rec, initial_status = None ):
         if args.verbose > 3:
             print( ip_address )
         configured_settings = get_url( ip_address, args.pause_time, args.verbose, get_settings_url( ip_address ), 'to get config' )
-        actions = get_actions( ip_address, 1, args.verbose )
-        if actions and 'actions' in actions:
-            rec['actions'] = actions[ 'actions' ]
+        if dev_gen < 2:
+            actions = get_actions( ip_address, 1, args.verbose )
+            if actions and 'actions' in actions:
+                rec['actions'] = actions[ 'actions' ]
         id = initial_status['mac']
         if id in device_db:
             rec.update( device_db[ id ] )
@@ -3136,6 +3137,11 @@ def provision_native( credentials, args, new_version ):
                 ip_address = found
 
             print( "Attempting to connect to device back on " + ssid )
+
+            ### Wait for SLOW connection
+            time.sleep( 20 )
+            ###
+
             stat = wrap_up( ip_address, found, ssid, rec, new_version, args )
             if stat == 'Quit': return false
             if stat == 'Fail': break
