@@ -2204,7 +2204,7 @@ def ota_flash( addr, tm, fw, verbose, dry_run ):
 
 def find_device( dev ):
     try:
-        attempt = url_read( 'http://' + dev[ 'IP' ] + '/ota', tmout = 0.5 )
+        attempt = url_read( status_url( dev[ 'IP' ] ), tmout = 0.5 )
     except:
         attempt = None
     if attempt: return True
