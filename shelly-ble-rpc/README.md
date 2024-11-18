@@ -22,7 +22,7 @@ Ensure you have Python 3.8 or higher installed on your system.
 1. Clone the repository:
 
    ```bash
-   git clone https://gitlab.allterco.net/simeon.marinov/shelly-ble-rpc.git
+   git clone https://github.com/ALLTERCO/Utilities.git
    cd shelly-ble-rpc
    ```
 
