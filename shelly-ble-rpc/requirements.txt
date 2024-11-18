@@ -1,0 +1,4 @@
+bleak>=0.15.0
+colorama>=0.4.4
+prettytable>=2.1.0
+yaspin>=2.1.0
