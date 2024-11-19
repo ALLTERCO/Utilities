@@ -57,14 +57,49 @@ Activate the virtual environment and run the script:
 
 ### Command-line Arguments
 
-- `--scan-duration`: Duration to scan for BLE devices (in seconds). Default: `5` seconds.
+- **`--scan-duration`**
+  
+  Duration to scan for BLE devices (in seconds).  
+  **Default:** `5` seconds.
 
-- `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL). Default: `INFO`.
+- **`--log-level`**
+  
+  Sets the logging level.  
+  **Choices:** `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`  
+  **Default:** `INFO`.
+
+- **`--wifi-ssid`**
+  
+  SSID for WiFi configuration.
+
+- **`--wifi-password`**
+  
+  Password for WiFi configuration.
+
+- **`--gateway`**
+  
+  Gateway to use for static IP configuration.
+
+- **`--netmask`**
+  
+  Netmask to use for static IP configuration.
+
+- **`--nameserver`**
+  
+  Nameserver to use for static IP configuration.
+
+- **`--filter-name`**
+  
+  Filter devices by name (case-insensitive).
+
+- **`--filter-address`**
+  
+  Filter devices by address (case-insensitive).
 
 Example:
 
    ```bash
-   python3 shelly-ble-rpc.py --scan-duration 10 --log-level DEBUG
+   python3 shelly-ble-rpc.py --scan-duration 10 --log-level DEBUG  --wifi-ssid "wifi SSID" --wifi-password "wifi-password" --gateway 10.10.10.1 --netmask 255.255.254.0 --nameserver 8.8.8.8
    ```
 
 ### Interactive Features

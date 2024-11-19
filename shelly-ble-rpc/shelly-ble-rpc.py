@@ -90,6 +90,9 @@ class RPCExecutionError(Exception):
     """Exception raised when RPC execution fails."""
 
 
+class RescanWithNewFiltersException(Exception):
+    """Custom exception to handle rescan with new filters."""
+
 # ============================
 # Color Output Helpers
 # ============================
@@ -97,9 +100,10 @@ class RPCExecutionError(Exception):
 
 def print_header(message: str) -> None:
     """Prints a header message in cyan."""
-    print(f"{Fore.CYAN}{'=' * len(message)}")
+    border = "=" * len(message)
+    print(f"{Fore.CYAN}{border}")
     print(f"{Fore.CYAN}{message}")
-    print(f"{Fore.CYAN}{'=' * len(message)}")
+    print(f"{Fore.CYAN}{border}{Style.RESET_ALL}")
 
 
 def print_ble_step(message: str) -> None:
@@ -125,7 +129,6 @@ def print_normal_step(message: str) -> None:
 def print_error(message: str) -> None:
     """Prints an error message in red."""
     print(f"{Fore.RED}{Style.BRIGHT}{message}{Style.RESET_ALL}")
-
 
 # ============================
 # Logging Helper
@@ -187,6 +190,13 @@ def print_with_jq(data: Dict[str, Any]) -> None:
 class Config:
     scan_duration: int
     log_level: str
+    wifi_ssid: Optional[str] = None
+    wifi_password: Optional[str] = None
+    gateway: Optional[str] = None
+    netmask: Optional[str] = None
+    nameserver: Optional[str] = None
+    filter_name: Optional[str] = None
+    filter_address: Optional[str] = None
 
 
 # ============================
@@ -215,6 +225,42 @@ def parse_arguments() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Set the logging level.",
     )
+    parser.add_argument(
+        "--wifi-ssid",
+        type=str,
+        help="SSID for WiFi configuration (use quotes if SSID contains spaces).",
+    )
+    parser.add_argument(
+        "--wifi-password",
+        type=str,
+        help="Password for WiFi configuration.",
+    )
+    parser.add_argument(
+        "--gateway",
+        type=str,
+        help="Gateway to use for static IP configuration.",
+    )
+    parser.add_argument(
+        "--netmask",
+        type=str,
+        help="Netmask to use for static IP configuration.",
+    )
+    parser.add_argument(
+        "--nameserver",
+        type=str,
+        help="Nameserver to use for static IP configuration.",
+    )
+    # New filtering arguments
+    parser.add_argument(
+        "--filter-name",
+        type=str,
+        help="Filter devices by name (case-insensitive).",
+    )
+    parser.add_argument(
+        "--filter-address",
+        type=str,
+        help="Filter devices by address (case-insensitive).",
+    )
     return parser.parse_args()
 
 
@@ -237,7 +283,17 @@ def load_config(args: argparse.Namespace) -> Config:
     global logger
     logger = setup_logging(args.log_level.upper())
 
-    return Config(scan_duration=args.scan_duration, log_level=args.log_level.upper())
+    return Config(
+        scan_duration=args.scan_duration,
+        log_level=args.log_level.upper(),
+        wifi_ssid=args.wifi_ssid,
+        wifi_password=args.wifi_password,
+        gateway=args.gateway,
+        netmask=args.netmask,
+        nameserver=args.nameserver,
+        filter_name=args.filter_name,
+        filter_address=args.filter_address,
+    )
 
 
 # ============================
@@ -274,7 +330,7 @@ class ShellyDevice:
 
                     # Proceed with RPC operations
                     await asyncio.wait_for(self.retrieve_shelly_service(client), timeout=timeout)
-                    await asyncio.wait_for(self.fetch_characteristics(), timeout=timeout)
+                    await asyncio.wait_for(self.fetch_characteristics(client), timeout=timeout)
 
                     length_bytes, request_id, rpc_request_bytes = self.prepare_rpc_request(
                         method, params
@@ -345,7 +401,7 @@ class ShellyDevice:
             log_error(f"Error retrieving Shelly GATT Service: {e}")
             raise
 
-    async def fetch_characteristics(self) -> None:
+    async def fetch_characteristics(self, client: BleakClient) -> None:
         """Fetches the required BLE characteristics from the Shelly service."""
         try:
             self.data_char = self.shelly_service.get_characteristic(RPC_CHAR_DATA_UUID)
@@ -388,9 +444,6 @@ class ShellyDevice:
         except BleakError as e:
             log_error(f"Failed to write length to TX Control Characteristic: {e}")
             raise
-
-        # Remove unnecessary sleep
-        # await asyncio.sleep(0.1)
 
         log_debug("Writing RPC Request to Data Characteristic...")
         try:
@@ -496,10 +549,17 @@ def handle_signal(signal_num: int, frame: Any) -> None:
 # ============================
 
 
-async def scan_and_list_devices(scan_duration: int) -> List[Dict[str, Any]]:
-    """Scans for Shelly devices over BLE with a spinner."""
+async def scan_and_list_devices(
+    scan_duration: int,
+    filter_name: Optional[str] = None,
+    filter_address: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Scans for Shelly devices over BLE with a spinner and optional filters."""
     discovered_devices: List[Dict[str, Any]] = []
     discovered_addresses = set()
+
+    filter_name_lower = filter_name.lower() if filter_name else None
+    filter_address_lower = filter_address.lower() if filter_address else None
 
     def discovery_handler(device: BLEDevice, advertisement_data: AdvertisementData):
         if device.name is None:
@@ -512,6 +572,12 @@ async def scan_and_list_devices(scan_duration: int) -> List[Dict[str, Any]]:
             return
 
         if device.address in discovered_addresses:
+            return
+
+        # Apply name and address filters (case-insensitive)
+        if filter_name_lower and filter_name_lower not in device.name.lower():
+            return
+        if filter_address_lower and filter_address_lower not in device.address.lower():
             return
 
         # Exclude devices with weak signal
@@ -538,6 +604,29 @@ async def scan_and_list_devices(scan_duration: int) -> List[Dict[str, Any]]:
     return discovered_devices
 
 
+def print_devices_table(devices: List[Dict[str, str]]):
+    """Prints the list of devices in a formatted table."""
+    if not devices:
+        print_error("No devices found.")
+        return
+
+    # Create PrettyTable
+    table = PrettyTable(["No", "Name", "Address", "RSSI"])
+    table.set_style(TableStyle.SINGLE_BORDER)
+    table.align = "l"
+
+    for index, device in enumerate(devices, start=1):
+        table.add_row(
+            [
+                index,
+                f"{Fore.GREEN}{device['name']}{Style.RESET_ALL}",
+                f"{Fore.MAGENTA}{device['address']}{Style.RESET_ALL}",
+                colorize_rssi(device["rssi"]),
+            ]
+        )
+    print(table)
+
+
 # ============================
 # Main Function
 # ============================
@@ -550,51 +639,149 @@ async def main() -> None:
 
     log_info("Script started.")
 
+    # Initialize filters
+    current_filter_name = config.filter_name  # Filter by device name
+    current_filter_address = config.filter_address  # Filter by device address
+
     while True:
-        devices = await scan_and_list_devices(config.scan_duration)
+        try:
+            devices = await scan_and_list_devices(
+                config.scan_duration, current_filter_name, current_filter_address
+            )
+        except Exception as e:
+            log_error(f"Error during scanning: {e}")
+            print_error(f"Error during scanning: {e}")
+            return
 
         if not devices:
             print_error("No devices found.")
-            continue
+            # Offer options to rescan with current filter, remove filter, apply new filter, or quit
+            if current_filter_name or current_filter_address:
+                action = input(
+                    f"{Fore.YELLOW}Options:\n"
+                    f"  'r' - Rescan with current filter\n"
+                    f"  'n' - Rescan with no filter\n"
+                    f"  'f' - Rescan with different filter\n"
+                    f"  'q' - Quit\n"
+                    f"Choose an option: {Style.RESET_ALL}"
+                ).strip().lower()
+                if action == 'q':
+                    print_success("Exiting...")
+                    log_info("Script completed.")
+                    sys.exit(0)
+                elif action == 'r':
+                    continue  # Rescan with current filter
+                elif action == 'n':
+                    current_filter_name = None
+                    current_filter_address = None
+                    continue  # Rescan with no filter
+                elif action == 'f':
+                    new_filter_name = input(f"{Fore.YELLOW}Enter new name filter (or leave empty for no filter): {Style.RESET_ALL}").strip()
+                    new_filter_address = input(f"{Fore.YELLOW}Enter new address filter (or leave empty for no filter): {Style.RESET_ALL}").strip()
+                    current_filter_name = new_filter_name if new_filter_name else None
+                    current_filter_address = new_filter_address if new_filter_address else None
+                    continue  # Rescan with new filter
+                else:
+                    print_error("Invalid input.")
+                    continue
+            else:
+                action = input(
+                    f"{Fore.YELLOW}Options:\n"
+                    f"  'r' - Rescan\n"
+                    f"  'f' - Rescan with different filter\n"
+                    f"  'q' - Quit\n"
+                    f"Choose an option: {Style.RESET_ALL}"
+                ).strip().lower()
+                if action == 'q':
+                    print_success("Exiting...")
+                    log_info("Script completed.")
+                    sys.exit(0)
+                elif action == 'r':
+                    continue  # Rescan with no filter
+                elif action == 'f':
+                    new_filter_name = input(f"{Fore.YELLOW}Enter new name filter (or leave empty for no filter): {Style.RESET_ALL}").strip()
+                    new_filter_address = input(f"{Fore.YELLOW}Enter new address filter (or leave empty for no filter): {Style.RESET_ALL}").strip()
+                    current_filter_name = new_filter_name if new_filter_name else None
+                    current_filter_address = new_filter_address if new_filter_address else None
+                    continue  # Rescan with new filter
+                else:
+                    print_error("Invalid input.")
+                    continue
 
         # Display devices
         print_header("Discovered devices:")
-        table = PrettyTable(["No", "Name", "Address", "RSSI"])
-        table.set_style(TableStyle.SINGLE_BORDER)
-        table.align = "l"
-        for index, device in enumerate(devices, start=1):
-            table.add_row(
-                [
-                    index,
-                    f"{Fore.GREEN}{device['name']}{Style.RESET_ALL}",
-                    f"{Fore.MAGENTA}{device['address']}{Style.RESET_ALL}",
-                    colorize_rssi(device["rssi"]),
-                ]
-            )
-        print(table)
+        print_devices_table(devices)
 
         # Select a device
-        selected_device_info = await select_device(devices)
+        try:
+            selected_device_info = await select_device(devices, current_filter_name, current_filter_address)
+        except RescanWithNewFiltersException:
+            # Prompt for new filters
+            new_filter_name = input(
+                f"{Fore.YELLOW}Enter new name filter (or leave empty for no filter): {Style.RESET_ALL}"
+            ).strip()
+            new_filter_address = input(
+                f"{Fore.YELLOW}Enter new address filter (or leave empty for no filter): {Style.RESET_ALL}"
+            ).strip()
+            current_filter_name = new_filter_name if new_filter_name else None
+            current_filter_address = new_filter_address if new_filter_address else None
+            continue
+
+        if selected_device_info == 'remove_filter':
+            # Remove current filters
+            current_filter_name = None
+            current_filter_address = None
+            continue
+
         if not selected_device_info:
+            # User chose to rescan or remove filters
             continue
 
         # Command selection loop
-        await command_selection_loop(selected_device_info)
+        try:
+            result = await command_selection_loop(selected_device_info, config, current_filter_name, current_filter_address)
+            if result == 'rescan':
+                continue  # Indicate that we need to rescan
+        except RescanWithNewFiltersException:
+            # Prompt for new filters
+            new_filter_name = input(
+                f"{Fore.YELLOW}Enter new name filter (or leave empty for no filter): {Style.RESET_ALL}"
+            ).strip()
+            new_filter_address = input(
+                f"{Fore.YELLOW}Enter new address filter (or leave empty for no filter): {Style.RESET_ALL}"
+            ).strip()
+            current_filter_name = new_filter_name if new_filter_name else None
+            current_filter_address = new_filter_address if new_filter_address else None
+            continue
 
 
-async def select_device(devices: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+# ============================
+# Device Selection Function
+# ============================
+
+
+async def select_device(devices: List[Dict[str, Any]], name_filter: Optional[str], address_filter: Optional[str]) -> Optional[Dict[str, Any]]:
     """Allows the user to select a device from the list."""
     selected_device = None
     while not selected_device:
-        selection = input(
-            f"{Fore.YELLOW}Select a device by number, 'r' to rescan, or 'q' to quit: {Style.RESET_ALL}"
+        prompt_options = (
+            f"Select a device by number, 'r' to rescan, 'f' to apply new filters, "
+            f"{'n to remove filters, ' if name_filter or address_filter else ''}'q' to quit: "
         )
-        if selection.lower() == "q":
+        selection = input(
+            f"{Fore.YELLOW}{prompt_options}{Style.RESET_ALL}"
+        ).strip().lower()
+        if selection == "q":
             print_success("Exiting...")
             log_info("Script completed.")
             sys.exit(0)
-        elif selection.lower() == "r":
-            return None
+        elif selection == "r":
+            return None  # Rescan with current filters
+        elif selection == "f":
+            # Indicate to apply new filters
+            raise RescanWithNewFiltersException()
+        elif selection == "n" and (name_filter or address_filter):
+            return 'remove_filter'  # Signal to remove filters
         try:
             selection_num = int(selection)
             if 1 <= selection_num <= len(devices):
@@ -602,11 +789,16 @@ async def select_device(devices: List[Dict[str, Any]]) -> Optional[Dict[str, Any
             else:
                 print_error("Invalid selection. Please select a valid device number.")
         except ValueError:
-            print_error("Invalid input. Please enter a number, 'r' to rescan, or 'q' to quit.")
+            print_error("Invalid input. Please enter a number, 'r', 'f', 'n', or 'q'.")
     return selected_device
 
 
-async def command_selection_loop(selected_device_info: Dict[str, Any]) -> None:
+# ============================
+# Command Selection Function
+# ============================
+
+
+async def command_selection_loop(selected_device_info: Dict[str, Any], config: Config, name_filter: Optional[str], address_filter: Optional[str]) -> Optional[str]:
     """Handles the command selection and execution loop for the selected device."""
     device = ShellyDevice(selected_device_info["address"])
     device_info_str = (
@@ -617,6 +809,7 @@ async def command_selection_loop(selected_device_info: Dict[str, Any]) -> None:
         f"Selected device: {selected_device_info['name']} ({selected_device_info['address']})"
     )
 
+    # Updated commands list to include 'Shelly.Reboot' and 'Eth.GetStatus'
     commands = [
         "Shelly.ListMethods",
         "Shelly.GetDeviceInfo",
@@ -626,6 +819,8 @@ async def command_selection_loop(selected_device_info: Dict[str, Any]) -> None:
         "WiFi.GetStatus",
         "Eth.GetConfig",
         "Eth.SetConfig",
+        "Eth.GetStatus",         # Added Eth.GetStatus
+        "Shelly.Reboot",        # Added Shelly.Reboot
         "Switch.Toggle",
         "Custom Command",
     ]
@@ -635,27 +830,48 @@ async def command_selection_loop(selected_device_info: Dict[str, Any]) -> None:
         for i, command in enumerate(commands, start=1):
             print(f"{Fore.YELLOW}{i}. {command}{Style.RESET_ALL}")
 
+        # Determine if 'n' should be offered
+        if name_filter or address_filter:
+            prompt_options = "Select a command by number, 'r' to rescan, 'f' to apply new filters, 'n' to remove filters, or 'q' to quit: "
+        else:
+            prompt_options = "Select a command by number, 'r' to rescan, 'f' to apply new filters, or 'q' to quit: "
+
         cmd_selection = input(
-            f"{Fore.YELLOW}Select a command by number, 'r' to rescan, 'q' to quit: {Style.RESET_ALL}"
-        )
-        if cmd_selection.lower() == "q":
+            f"{Fore.YELLOW}{prompt_options}{Style.RESET_ALL}"
+        ).strip().lower()
+
+        if cmd_selection == "q":
             print_success("Exiting...")
             log_info("Script completed.")
             sys.exit(0)
-        elif cmd_selection.lower() == "r":
-            break
+        elif cmd_selection == "r":
+            # Rescan with current filters
+            return 'rescan'
+        elif cmd_selection == "f":
+            # Apply new filters
+            raise RescanWithNewFiltersException()
+        elif cmd_selection == "n" and (name_filter or address_filter):
+            # Remove current filters and rescan
+            return 'remove_filter'
         try:
             cmd_selection_num = int(cmd_selection)
             if 1 <= cmd_selection_num <= len(commands):
                 chosen_command = commands[cmd_selection_num - 1]
-                await execute_command(device, chosen_command, device_info_str)
+                result = await execute_command(device, chosen_command, device_info_str, config)
+                if result == 'rescan':
+                    return 'rescan'  # Indicate that we want to rescan
             else:
                 print_error("Invalid selection. Please select a valid command number.")
         except ValueError:
-            print_error("Invalid input. Please enter a number, 'r' to rescan, or 'q' to quit.")
+            print_error("Invalid input. Please enter a number, 'r', 'f', 'n', or 'q'.")
 
 
-async def execute_command(device: ShellyDevice, command: str, device_info_str: str) -> None:
+# ============================
+# Command Execution Function
+# ============================
+
+
+async def execute_command(device: ShellyDevice, command: str, device_info_str: str, config: Config) -> Optional[str]:
     """Executes the selected command on the device."""
     params = None
 
@@ -673,15 +889,22 @@ async def execute_command(device: ShellyDevice, command: str, device_info_str: s
             params["id"] = int(id_input)
             print(f"{Fore.CYAN}Using provided ID: {params['id']}{Style.RESET_ALL}")
     elif command == "WiFi.SetConfig":
-        ssid = input(f"{Fore.YELLOW}Enter SSID: {Style.RESET_ALL}")
-        password = input(f"{Fore.YELLOW}Enter Password: {Style.RESET_ALL}")
+        ssid = config.wifi_ssid or input(f"{Fore.YELLOW}Enter SSID: {Style.RESET_ALL}")
+        if config.wifi_password:
+            password = config.wifi_password
+            print(f"{Fore.CYAN}Using provided WiFi password from arguments.{Style.RESET_ALL}")
+        else:
+            password = input(f"{Fore.YELLOW}Enter Password: {Style.RESET_ALL}")
         use_static = input(f"{Fore.YELLOW}Do you want to set a static IP address? (y/n): {Style.RESET_ALL}")
         if use_static.lower() == 'y':
             ipv4mode = "static"
             ip = input(f"{Fore.YELLOW}Enter Static IP Address: {Style.RESET_ALL}")
-            netmask = input(f"{Fore.YELLOW}Enter Netmask: {Style.RESET_ALL}")
-            gw = input(f"{Fore.YELLOW}Enter Gateway: {Style.RESET_ALL}")
-            nameserver = input(f"{Fore.YELLOW}Enter Nameserver: {Style.RESET_ALL}")
+            netmask = config.netmask or input(f"{Fore.YELLOW}Enter Netmask (default 255.255.255.0): {Style.RESET_ALL}") or "255.255.255.0"
+            gw = config.gateway or input(f"{Fore.YELLOW}Enter Gateway: {Style.RESET_ALL}")
+            nameserver = config.nameserver or input(f"{Fore.YELLOW}Enter Nameserver: {Style.RESET_ALL}")
+            print(f"{Fore.CYAN}Using netmask: {netmask}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}Using gateway: {gw}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}Using nameserver: {nameserver}{Style.RESET_ALL}")
             params = {
                 "config": {
                     "sta": {
@@ -697,6 +920,7 @@ async def execute_command(device: ShellyDevice, command: str, device_info_str: s
                 }
             }
         else:
+            ipv4mode = "dhcp"
             params = {
                 "config": {
                     "sta": {
@@ -721,31 +945,44 @@ async def execute_command(device: ShellyDevice, command: str, device_info_str: s
             if use_static.lower() == 'y':
                 ipv4mode = "static"
                 ip = input(f"{Fore.YELLOW}Enter Static IP Address: {Style.RESET_ALL}")
-                netmask = input(f"{Fore.YELLOW}Enter Netmask (press Enter for default 255.255.255.0): {Style.RESET_ALL}")
-                netmask = netmask if netmask else "255.255.255.0"
-                gw = input(f"{Fore.YELLOW}Enter Gateway (press Enter to skip): {Style.RESET_ALL}")
-                gw = gw if gw else None
-                nameserver = input(f"{Fore.YELLOW}Enter Nameserver (press Enter to skip): {Style.RESET_ALL}")
-                nameserver = nameserver if nameserver else None
+                netmask = config.netmask or input(f"{Fore.YELLOW}Enter Netmask (default 255.255.255.0): {Style.RESET_ALL}") or "255.255.255.0"
+                gw = config.gateway or input(f"{Fore.YELLOW}Enter Gateway (press Enter to skip): {Style.RESET_ALL}")
+                nameserver = config.nameserver or input(f"{Fore.YELLOW}Enter Nameserver (press Enter to skip): {Style.RESET_ALL}")
+                print(f"{Fore.CYAN}Using netmask: {netmask}{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}Using gateway: {gw}{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}Using nameserver: {nameserver}{Style.RESET_ALL}")
                 params = {
                     "config": {
                         "enable": True,
                         "ipv4mode": ipv4mode,
                         "ip": ip,
                         "netmask": netmask,
-                        "gw": gw,
-                        "nameserver": nameserver
+                        "gw": gw if gw else "",
+                        "nameserver": nameserver if nameserver else ""
                     }
                 }
             else:
+                ipv4mode = "dhcp"
                 params = {
                     "config": {
                         "enable": True,
                         "ipv4mode": "dhcp"
                     }
                 }
+    elif command == "Eth.GetStatus":
+        # No parameters needed for Eth.GetStatus
+        pass
+    elif command == "Shelly.Reboot":
+        # No parameters needed for Shelly.Reboot
+        pass
+    elif command == "WiFi.GetStatus":
+        # No parameters needed
+        pass
+    elif command == "Eth.GetConfig":
+        # No parameters needed
+        pass
     elif command == "Custom Command":
-        command = input(f"{Fore.YELLOW}Enter the RPC method name: {Style.RESET_ALL}")
+        custom_command = input(f"{Fore.YELLOW}Enter the RPC method name: {Style.RESET_ALL}")
         params_input = input(
             f"{Fore.YELLOW}Enter parameters as a JSON string (or leave empty for none): {Style.RESET_ALL}"
         )
@@ -758,22 +995,38 @@ async def execute_command(device: ShellyDevice, command: str, device_info_str: s
     print_header(f"Executing '{command}' on {device_info_str}...")
 
     try:
-        result = await device.call_rpc(command, params=params)
+        # Determine the actual RPC method to call
+        if command == "Custom Command":
+            rpc_method = custom_command
+        else:
+            rpc_method = command
+
+        result = await device.call_rpc(rpc_method, params=params)
         if result:
-            print_success(f"RPC Method '{command}' executed successfully. Result:")
+            print_success(f"RPC Method '{rpc_method}' executed successfully. Result:")
             print_with_jq(result.get("result", {}))
         else:
-            print_success(f"RPC Method '{command}' executed successfully. No data returned.")
+            print_success(f"RPC Method '{rpc_method}' executed successfully. No data returned.")
+
+        # **Automatically reboot after WiFi.SetConfig or Eth.SetConfig**
+        if command in ["WiFi.SetConfig", "Eth.SetConfig"]:
+            print(f"{Fore.YELLOW}Configuration saved. Sending 'Shelly.Reboot' to apply changes...{Style.RESET_ALL}")
+            reboot_result = await device.call_rpc("Shelly.Reboot")
+            if reboot_result:
+                print_success(f"'Shelly.Reboot' executed successfully. The device will reboot to apply the changes.")
+            else:
+                print_success(f"'Shelly.Reboot' executed successfully. The device will reboot to apply the changes.")
+
     except RPCExecutionError as e:
         error_message = str(e)
         print_error(error_message)
         # Check if the error indicates an unavailable RPC method
         if "No handler for" in error_message or "'code': 404" in error_message:
-            print_error(f"The RPC method '{command}' is not available on this device.")
+            print_error(f"The RPC method '{rpc_method}' is not available on this device.")
             list_methods = input(
                 f"{Fore.YELLOW}Would you like to list available methods? (y/n): {Style.RESET_ALL}"
-            )
-            if list_methods.lower() == 'y':
+            ).strip().lower()
+            if list_methods == 'y':
                 await list_available_methods(device)
         # Check if the error indicates invalid arguments
         elif "'code': -103" in error_message or "Invalid argument" in error_message:
@@ -782,6 +1035,8 @@ async def execute_command(device: ShellyDevice, command: str, device_info_str: s
     except Exception as e:
         log_error(f"Unexpected error during command execution: {e}")
         print_error(f"Unexpected error: {e}")
+
+    return None  # Continue normally
 
 
 async def list_available_methods(device: ShellyDevice) -> None:
@@ -793,6 +1048,16 @@ async def list_available_methods(device: ShellyDevice) -> None:
         print_with_jq({"methods": methods})
     except Exception as e:
         print_error(f"Failed to list available methods: {e}")
+
+
+# ============================
+# Utility Exception Classes
+# ============================
+
+
+class RescanWithNewFiltersException(Exception):
+    """Custom exception to handle rescan with new filters."""
+    pass
 
 
 # ============================
@@ -810,6 +1075,10 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_signal)
 
     try:
+        asyncio.run(main())
+    except RescanWithNewFiltersException:
+        # Handle rescan with new filters
+        # Restart the main function with new filters
         asyncio.run(main())
     except KeyboardInterrupt:
         log_info("Script interrupted by user via KeyboardInterrupt.")
