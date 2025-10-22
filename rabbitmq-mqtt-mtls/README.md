@@ -68,10 +68,16 @@ Key ideas:
   - The topic prefix you configure in Shelly (e.g., `shelly`).
 - `--connect-dns <name>` or `--connect-ip <ip>`
   - What devices will dial; used for the **server cert CN/SAN** and shown as `<host>:8883`.
+- `-i, --ip, --server-ip <ip>`
+  - Force the primary server IP (used for detection and added to the server cert SANs).
 - `--keep-plaintext`
   - Keep **1883** (MQTT) and **15672** (HTTP mgmt) open for migration.
+- `-l, --log-level <debug|info|warn|error>`
+  - Broker log level (default `info`).
 - `--debug`
   - Stream command output; disables spinner.
+- `--debug-tls` (alias `--tls-debug`)
+  - Print a detailed TLS/certificate diagnostics block at the end (opt-in).
 - `--force-regen`
   - Regenerate CA/server/client certs even if they exist (rotate credentials).
 - `--rmq-series 3.13|4.0|4.1`
@@ -83,7 +89,9 @@ Key ideas:
 - `-p, --admin-pass <pass>` (otherwise auto‑generated)
 - `--client-cn <CN>` (default `Shelly-Group`)
 - `--client-id <id>` (defaults to `CLIENT_CN`; also used as **SAN URI**)
-- `--vhost <vhost>` (default `/shelly`)
+- `-V, --vhost <vhost>` (default `/shelly`)
+- `--monitor-client-id <id>` — Set a distinct client_id for the optional monitor bundle
+  (defaults to `${CLIENT_ID}-mon`).
 
 ### Paths
 
@@ -105,14 +113,15 @@ Key ideas:
 | `TLS_DIR` | `/etc/rabbitmq-tls` | Stores CA/server/client materials |
 | `EXPORT_DIR` | `/etc/mqtt-cert` | Safe folder with only `ca.crt`, `client.crt`, `client.key` |
 | `MAKE_MONITOR_CERT` | `true` | Create a second bundle for monitoring |
-| `MONITOR_CLIENT_ID` | `${CLIENT_ID}-mon` | Distinct client_id for monitoring |
+| `MONITOR_CLIENT_ID` | `${CLIENT_ID}-mon` | Distinct client_id for monitoring (also via `--monitor-client-id`) |
 | `MONITOR_EXPORT_DIR` | `/etc/mqtt-cert-monitor` | Safe export for monitor bundle |
 | `MQTT_PREFIX` | `something` | Topic prefix enforced by ACLs (slash & dot forms) |
-| `SERVER_IP` | _(auto)_/manual | Primary IP detection (default route) |
+| `SERVER_IP` | _(auto)_/manual | Primary IP detection (default route); override with `-i/--ip/--server-ip` |
 | `CONNECT_DNS` / `CONNECT_IP` | _(auto)_/manual | Determines server cert CN/SAN and device dial target |
-| `LOG_LEVEL` | `info` | Broker log level |
+| `LOG_LEVEL` | `info` | Broker log level (`debug`, `info`, `warn`, `error`); also via `-l/--log-level` |
 | `FORCE_REGEN` | `false` | Rotate certificates even if present |
 | `RMQ_SERIES` | `4.1` | RabbitMQ series (`3.13`, `4.0`, `4.1`) |
+| `DEBUG_TLS` | `0` | Set to `1` **or** pass `--debug-tls` to print the TLS diagnostics block |
 
 ---
 
@@ -123,7 +132,7 @@ Key ideas:
     ```bash
     chmod +x setup-rabbitmq-mqtt.sh
 
-    ./setup-rabbitmq-mqtt.sh --admin-user admin   --admin-pass 'Sh3lly-i0T!'   -C 'Shelly-Group'   --client-id 'test-device'   --vhost /shelly   --mqtt-prefix dimmer
+    ./setup-rabbitmq-mqtt.sh --admin-user admin   --admin-pass 'Sh3lly-i0T!'   -C 'Shelly-Group'   --client-id 'test-device'   --vhost /shelly   --mqtt-prefix 1pm-mini
     ```
 
 2) When it finishes, copy the **Shelly Settings** the script prints and upload the three files it prepared:
@@ -152,7 +161,7 @@ Key ideas:
 
 - Generates a **private CA** you control.
 - **Server cert** CN/SAN match what clients dial (`--connect-dns` or `--connect-ip`).
-- **Client cert** CN = `CLIENT_CN` (becomes a RabbitMQ user) and **SAN URI = CLIENT_ID`**.
+- **Client cert** CN = `CLIENT_CN` (becomes a RabbitMQ user) and **SAN URI = `CLIENT_ID`**.
 - Optional second client cert for **monitoring** with a distinct client_id.
 - Keys are owned by `root:rabbitmq` with restrictive permissions.
 
@@ -224,10 +233,11 @@ Instead of separate test recipes, this example relies on the **exact, ready‑to
 - Messages under your `MQTT_PREFIX` show up.  
 - The Management UI shows a connected MQTT client with your **Client ID**.
 
-  **TLS quick diagnostics (already handled by the script)**
+**TLS diagnostics (optional)**
 
-- The script prints a **TLS diagnostics** block with local certificate details.
-- If it says _“Could not retrieve remote certificate - port closed, firewall, or handshake blocked”_, check security groups/firewalls and that the broker is listening on **8883**.
+- Run the script with `--debug-tls` (or set `DEBUG_TLS=1`) to print a **local** TLS summary (`cert/key` matching, `SANs`, `KU/EKU`, `expiry`).
+- This diagnostics block inspects the files the script generated; it does **not** fetch a remote certificate.
+- To verify connectivity to the broker, use the `mosquitto_sub` test above or run `sudo rabbitmq-diagnostics listeners` and confirm `mqtt.listeners.ssl.default = 8883` (and `management.ssl.port = 15671`). If connection fails, check UFW/security groups and that RabbitMQ is running.
 
 ---
 
@@ -239,18 +249,20 @@ Instead of separate test recipes, this example relies on the **exact, ready‑to
 - **Connectivity**: `--connect-dns` or `--connect-ip`
 - **Plaintext for debugging**: `--keep-plaintext`
 - **Logging**: `--debug` for streaming output; otherwise see `/tmp/rabbitmq-mqtt-setup.log`
-- **Rotation**: `--force-regen` to rotate CA/server/client certs
+- **Rotation**: `--force-regen` to rotate `CA/server/client` certs
 
 ---
 
 ## Troubleshooting
 
 - **Auth failed**: On RabbitMQ 4.x, ensure the device **Client ID equals the cert SAN URI**.
-- **TLS handshake fails**: Script enforces **TLS 1.2**; check device TLS support and that all three files were uploaded.
+- **TLS handshake fails**: Script enforces **`TLS 1.2`**; check device TLS support and that all three files were uploaded.
 - **Topic permission denied**: Publish/subscribe must live under your `MQTT_PREFIX`.
 - **Broker won’t start**: Tail `journalctl -u rabbitmq-server`. The script made a timestamped backup of `/etc/rabbitmq/rabbitmq.conf` you can restore.
-- **Ports closed**: If UFW is active the script opens 8883/15671 (and 1883/15672 when kept). Verify with `sudo ufw status`.
+- **Ports closed**: If UFW is active the script opens `8883/15671` (and `1883/15672` when kept). Verify with `sudo ufw status`.
 - **Where are the files?**: Paths and bundle locations are printed at the end of the script run.
+- **No topic ACL support**: On older RabbitMQ builds lacking `set_topic_permissions`,
+  the script warns and leaves broader topic access. Upgrade RabbitMQ to enforce prefix-scoped `publish/subscribe`.
 
 ---
 

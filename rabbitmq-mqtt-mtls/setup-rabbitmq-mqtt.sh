@@ -60,6 +60,8 @@ FORCE_REGEN="${FORCE_REGEN:-false}"
 
 # Mode: default=quiet with spinner; debug=verbose without spinner
 DEBUG=false
+# Extra switch to show TLS certificate summary diagnostics
+DEBUG_TLS="${DEBUG_TLS:-0}"
 
 # Spinner & logging for long/quiet ops
 SPINNER=true                      # default mode uses spinner
@@ -128,6 +130,7 @@ while [[ $# -gt 0 ]]; do
     --rmq-series)        RMQ_SERIES="$2"; shift 2;;
 
     -d|--debug)          DEBUG=true; SPINNER=false; shift ;;
+    --debug-tls|--tls-debug) DEBUG_TLS=1; shift ;;
 
     --) shift; break;;
     *)  warn "Unknown argument: $1"; shift;;
@@ -791,6 +794,296 @@ if [[ "${MAKE_MONITOR_CERT}" == "true" ]]; then
   ok "Monitor export folder ready: $MONITOR_EXPORT_DIR"
 fi
 
+# ---------- TLS SUMMARY DIAGNOSTICS (on-demand) ----------
+tls_summary_diagnostics() {
+  # ---------- TLS summary diagnostics (non-fatal) ----------
+  section "TLS summary diagnostics (non-fatal)"
+
+  # Non-fatal best-effort
+  set +e
+  set +o pipefail
+  trap - ERR
+
+  # ---- Vars ------------------------------------------------------------
+  local _TLS_DIR="${TLS_DIR:-/etc/rabbitmq-tls}"
+  local _EXPORT_DIR="${EXPORT_DIR:-${_TLS_DIR}}"
+
+  # sudo wrapper (no sudo if root / not available)
+  local _SUDO=""
+  if command -v sudo >/dev/null 2>&1 && [[ $(id -u) -ne 0 ]]; then _SUDO="sudo"; fi
+  _ossl() { $_SUDO openssl "$@"; }
+
+  # ---- Helpers ---------------------------------------------------------
+  local INDENT="  "
+  _perm_brief(){ command -v stat >/dev/null 2>&1 && $_SUDO stat -c "%a %U:%G" "$1" 2>/dev/null; }
+  _exists(){ $_SUDO test -f "$1"; }
+  _first_line(){ $_SUDO head -n1 "$1" 2>/dev/null; }
+
+  _days_left(){
+    local na ts_now ts_end
+    na="$(_ossl x509 -in "$1" -noout -enddate 2>/dev/null | awk -F= '{print $2}')"
+    [[ -z "$na" ]] && return
+    ts_now="$(date -u +%s)"; ts_end="$(date -u -d "$na" +%s 2>/dev/null)"
+    [[ -n "$ts_end" ]] && echo $(( (ts_end - ts_now) / 86400 ))
+  }
+
+  _finger_sha256(){ _ossl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | awk -F= '{print $2}'; }
+  _serial_of(){ _ossl x509 -in "$1" -noout -serial 2>/dev/null | awk -F= '{print $2}'; }
+
+  _cert_field(){
+    _ossl x509 -in "$1" -noout -text 2>/dev/null \
+    | awk -v k="$2" '
+        $0 ~ "X509v3 " k ":" {
+          val=$0; sub(/^.*X509v3 [^:]+: */,"",val)
+          if (val == "" || val ~ /^ *$/) { getline; val=$0 }
+          gsub(/^[ \t]+/,"",val); print val; exit
+        }'
+  }
+
+  _sigalg_of(){ _ossl x509 -in "$1" -noout -text 2>/dev/null \
+    | sed -n 's/^[[:space:]]*Signature Algorithm:[[:space:]]*//p' | head -n1; }
+
+  _pubkey_alg_of(){ _ossl x509 -in "$1" -noout -text 2>/dev/null \
+    | awk -F': ' '/Public Key Algorithm/{print $2; exit}'; }
+
+  _subject_rfc(){ _ossl x509 -in "$1" -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject= //'; }
+  _issuer_rfc(){  _ossl x509 -in "$1" -noout -issuer  -nameopt RFC2253 2>/dev/null | sed 's/^issuer= //';  }
+
+  _x509_version(){
+    local v; v="$(_ossl x509 -in "$1" -noout -text 2>/dev/null | awk '/Version:/{print $2; exit}')"
+    [[ -n "$v" ]] && echo "X.509 v$v" || echo "X.509 v?"
+  }
+
+  _key_brief(){
+    local key="$1" hdr fmt="PEM" enc="unencrypted" type="" bits="" curve=""
+    if ! _exists "$key"; then echo "<missing: $key>"; return; fi
+    hdr="$(_first_line "$key")"
+    case "$hdr" in
+      *"BEGIN RSA PRIVATE KEY"*) fmt="PKCS#1"; type="RSA" ;;
+      *"BEGIN EC PRIVATE KEY"*)  fmt="SEC1";  type="EC" ;;
+      *"BEGIN ENCRYPTED PRIVATE KEY"*) fmt="PKCS#8"; enc="encrypted" ;;
+      *"BEGIN PRIVATE KEY"*)     fmt="PKCS#8" ;;
+      *"BEGIN OPENSSH PRIVATE KEY"*) fmt="OpenSSH" ;;
+    esac
+    $_SUDO head -n5 "$key" 2>/dev/null | grep -q "ENCRYPTED" && enc="encrypted"
+    if _ossl rsa -in "$key" -noout -text >/dev/null 2>&1; then
+      type="RSA"
+      bits="$(_ossl rsa -in "$key" -noout -text 2>/dev/null | sed -n 's/.*Private-Key: (\([0-9]\+\) bit.*/\1/p' | head -n1)"
+    elif _ossl ec -in "$key" -noout -text >/dev/null 2>&1; then
+      type="EC"
+      curve="$(_ossl ec -in "$key" -noout -text 2>/dev/null | sed -n 's/ *ASN1 OID: *//p' | head -n1)"
+    fi
+    if [[ "$type" == "RSA" && -n "$bits" ]]; then
+      echo "RSA $bits (${fmt}, $enc), PEM."
+    elif [[ "$type" == "EC" && -n "$curve" ]]; then
+      echo "EC ($curve) (${fmt}, $enc), PEM."
+    else
+      echo "${type:-Unknown} (${fmt}, $enc), PEM."
+    fi
+  }
+
+  # --- Correct public key hashers (DER) ---------------------------------
+  _key_pub_hash(){
+    _ossl pkey -in "$1" -pubout -outform DER 2>/dev/null \
+    | _ossl dgst -sha256 -r 2>/dev/null | awk '{print $1}'
+  }
+  _cert_pub_hash(){
+    _ossl x509 -in "$1" -pubkey -noout 2>/dev/null \
+    | _ossl pkey -pubin -outform DER 2>/dev/null \
+    | _ossl dgst -sha256 -r 2>/dev/null | awk '{print $1}'
+  }
+
+  _match_key_cert(){
+    local key="$1" crt="$2" hk hc
+    if ! _exists "$key" || ! _exists "$crt"; then
+      printf "%s✖ key ↔ cert check skipped (missing files)%s\n" "$YELLOW" "$NC"; return
+    fi
+    hk="$(_key_pub_hash  "$key")"
+    hc="$(_cert_pub_hash "$crt")"
+    if [[ -n "$hk" && -n "$hc" ]]; then
+      if [[ "$hk" == "$hc" ]]; then
+        printf "%s✔ key ↔ cert match%s\n" "$GREEN" "$NC"
+      else
+        printf "%s✖ key ↔ cert DO NOT MATCH%s\n" "$RED" "$NC"
+      fi
+    else
+      printf "%s⚠ key ↔ cert check inconclusive%s\n" "$YELLOW" "$NC"
+    fi
+  }
+
+  _cert_brief(){
+    local crt="$1"
+    if ! _exists "$crt"; then echo "<missing: $crt>"; return; fi
+    local ver eku ku san bc sig start end left subj issuer serial fpr pka
+    ver="$(_x509_version "$crt")"
+    eku="$(_cert_field "$crt" "Extended Key Usage")"
+    ku="$(_cert_field "$crt" "Key Usage")"
+    san="$(_cert_field "$crt" "Subject Alternative Name")"
+    bc="$(_cert_field "$crt" "Basic Constraints")"
+    sig="$(_sigalg_of "$crt")"
+    pka="$(_pubkey_alg_of "$crt")"
+    start="$(_ossl x509 -in "$crt" -noout -startdate | cut -d= -f2)"
+    end="$(_ossl x509 -in "$crt" -noout -enddate   | cut -d= -f2)"
+    left="$(_days_left "$crt")"
+    subj="$(_subject_rfc "$crt")"
+    issuer="$(_issuer_rfc "$crt")"
+    serial="$(_serial_of "$crt")"
+    fpr="$(_finger_sha256 "$crt")"
+    echo "$ver, $([[ -n "$bc" ]] && echo "$bc, " )KU=${ku:-N/A}$([[ -n "$eku" ]] && echo ", EKU=$eku")."
+    [[ -n "$san" ]]    && echo "SANs: $san."
+    echo "Subject: $subj."
+    echo "Issuer : $issuer."
+    echo "SigAlg : ${sig:-N/A} (Public Key: ${pka:-unknown})."
+    echo "Serial : ${serial:-N/A}."
+    echo "Validity: $start → $end ($([[ -n "$left" ]] && echo "$left" || echo '?') days left)."
+    echo "SHA256 Fingerprint: ${fpr:-N/A}."
+  }
+
+  # ---- Summaries --------------------------------------------------------
+  printf "%sTLS Certificates Summary%s\n" "$CYAN$BOLD" "$NC"
+  echo "──────────────────────────────────────────────────────────"
+
+  printf "\n%s%s%s\n" "$PURPLE$BOLD" "CA (root)" "$NC"
+  printf "%s%s\n" "$INDENT" "ca.key:  $(_key_brief "${_TLS_DIR}/ca.key")"
+  _exists "${_TLS_DIR}/ca.key" && echo "${INDENT}(perms $(_perm_brief "${_TLS_DIR}/ca.key"))"
+  printf "%s%s\n" "$INDENT" "ca.crt:  $(_cert_brief "${_TLS_DIR}/ca.crt")"
+
+  printf "\n%s%s%s\n" "$PURPLE$BOLD" "Server (broker)" "$NC"
+  printf "%s%s\n" "$INDENT" "tls.key: $(_key_brief "${_TLS_DIR}/tls.key")"
+  _exists "${_TLS_DIR}/tls.key" && echo "${INDENT}(perms $(_perm_brief "${_TLS_DIR}/tls.key"))"
+  printf "%s%s\n" "$INDENT" "tls.crt: $(_cert_brief "${_TLS_DIR}/tls.crt")"
+  echo -n "${INDENT}"; _match_key_cert "${_TLS_DIR}/tls.key" "${_TLS_DIR}/tls.crt"
+  if _exists "${_TLS_DIR}/ca.crt" && _exists "${_TLS_DIR}/tls.crt"; then
+    echo "${INDENT}Chain verification:"
+    _ossl verify -CAfile "${_TLS_DIR}/ca.crt" "${_TLS_DIR}/tls.crt" 2>&1 | sed "s/^/${INDENT}${INDENT}/"
+  fi
+
+  printf "\n%s%s%s\n" "$PURPLE$BOLD" "Client (Shelly)" "$NC"
+  printf "%s%s\n" "$INDENT" "client.key: $(_key_brief "${_EXPORT_DIR}/client.key")"
+  _exists "${_EXPORT_DIR}/client.key" && echo "${INDENT}(perms $(_perm_brief "${_EXPORT_DIR}/client.key"))"
+  printf "%s%s\n" "$INDENT" "client.crt: $(_cert_brief "${_EXPORT_DIR}/client.crt")"
+  echo -n "${INDENT}"; _match_key_cert "${_EXPORT_DIR}/client.key" "${_EXPORT_DIR}/client.crt"
+
+  # ---- Key mapping diagnostics (helps explain mismatches) ---------------
+  echo
+  printf "\n%s%s%s\n" "$PURPLE$BOLD" "Key mapping diagnostics" "$NC"
+  local srv_kh="" srv_ch="" cli_kh="" cli_ch=""
+  _exists "${_TLS_DIR}/tls.key"        && srv_kh="$(_key_pub_hash  "${_TLS_DIR}/tls.key")"
+  _exists "${_TLS_DIR}/tls.crt"        && srv_ch="$(_cert_pub_hash "${_TLS_DIR}/tls.crt")"
+  _exists "${_EXPORT_DIR}/client.key"  && cli_kh="$(_key_pub_hash  "${_EXPORT_DIR}/client.key")"
+  _exists "${_EXPORT_DIR}/client.crt"  && cli_ch="$(_cert_pub_hash "${_EXPORT_DIR}/client.crt")"
+
+  [[ -n "$srv_kh" ]] && echo "${INDENT}Server key    pubkey SHA256: $srv_kh"
+  [[ -n "$srv_ch" ]] && echo "${INDENT}Server cert   pubkey SHA256: $srv_ch"
+  [[ -n "$cli_kh" ]] && echo "${INDENT}Client key    pubkey SHA256: $cli_kh"
+  [[ -n "$cli_ch" ]] && echo "${INDENT}Client cert   pubkey SHA256: $cli_ch"
+
+  if [[ -n "$srv_kh" && -n "$cli_ch" && "$srv_kh" == "$cli_ch" ]]; then
+    warn "Server key appears to match the CLIENT certificate (files likely swapped)."
+  fi
+  if [[ -n "$cli_kh" && -n "$srv_ch" && "$cli_kh" == "$srv_ch" ]]; then
+    warn "Client key appears to match the SERVER certificate (files likely swapped)."
+  fi
+  if [[ -n "$srv_kh" && -n "$srv_ch" && "$srv_kh" != "$srv_ch" && -n "$cli_kh" && -n "$cli_ch" && "$cli_kh" != "$cli_ch" ]]; then
+    echo "${INDENT}Tip: If both pairs mismatch, you may have regenerated certs without updating keys, or wrote keys to a different path."
+  fi
+
+  # ---- Policy checks (observed vs expected) -----------------------------
+  echo
+  printf "\n%s%s%s\n" "$PURPLE$BOLD" "Policy checks (observed vs expected)" "$NC"
+
+  local do_srv_checks=false do_cli_checks=false
+  _exists "${_TLS_DIR}/tls.crt"       && do_srv_checks=true
+  _exists "${_EXPORT_DIR}/client.crt" && do_cli_checks=true
+
+  if $do_srv_checks; then
+    local server_ku server_eku server_bc server_pka server_sig srv_left ec_curve srv_bits
+    server_ku="$(_cert_field "${_TLS_DIR}/tls.crt" "Key Usage")"
+    server_eku="$(_cert_field "${_TLS_DIR}/tls.crt" "Extended Key Usage")"
+    server_bc="$(_cert_field "${_TLS_DIR}/tls.crt" "Basic Constraints")"
+    server_pka="$(_pubkey_alg_of "${_TLS_DIR}/tls.crt" | tr '[:upper:]' '[:lower:]')"
+    server_sig="$(_sigalg_of "${_TLS_DIR}/tls.crt" | tr '[:upper:]' '[:lower:]')"
+
+    echo -n "${INDENT}"
+    [[ "$server_eku" =~ [Ss]erver ]] && ok "Server EKU includes serverAuth" || err "Server EKU missing serverAuth"
+
+    echo -n "${INDENT}"
+    if [[ "$server_ku" =~ [Dd]igital[[:space:]]*Signature ]] \
+       && [[ "$server_ku" =~ [Kk]ey[[:space:]]*(Encipherment|Agreement) ]]; then
+      ok "Server KU includes Digital Signature + Key Encipherment/Agreement"
+    else
+      warn "Server KU lacks typical bits (Digital Signature + Key Encipherment)"
+    fi
+
+    echo -n "${INDENT}"
+    [[ "$server_bc" =~ CA:TRUE ]] && err "Server leaf has CA:TRUE (should be CA:FALSE/absent)" || ok "Server leaf is not a CA"
+
+    echo -n "${INDENT}"
+    if [[ "$server_pka" == *ed25519* || "$server_sig" == *ed25519* ]]; then
+      err "Server uses Ed25519 (Shelly client does NOT support Ed25519 signatures)"
+    elif [[ "$server_pka" == *rsa* ]]; then
+      srv_bits="$(_ossl x509 -in "${_TLS_DIR}/tls.crt" -noout -text 2>/dev/null | sed -n 's/ *Public-Key: (\([0-9]\+\) bit.*/\1/p' | head -n1)"
+      [[ -n "$srv_bits" && "$srv_bits" -ge 2048 ]] && ok "Server RSA ≥ 2048 bits" || err "Server RSA < 2048 bits"
+    elif [[ "$server_pka" == *ec* ]]; then
+      ec_curve="$(_ossl x509 -in "${_TLS_DIR}/tls.crt" -noout -text 2>/dev/null | sed -n 's/ *ASN1 OID: *//p' | head -n1)"
+      [[ "$ec_curve" =~ prime256v1|secp256r1|secp384r1|secp521r1 ]] && ok "Server EC curve supported ($ec_curve)" || warn "EC curve may be unsupported ($ec_curve)"
+    else
+      warn "Unknown server key algorithm"
+    fi
+
+    echo -n "${INDENT}"
+    srv_left="$(_days_left "${_TLS_DIR}/tls.crt")"
+    if [[ -n "$srv_left" ]]; then
+      (( srv_left < 30 )) && warn "Server certificate expires in $srv_left days" || ok "Server certificate $srv_left days left"
+    fi
+  else
+    echo "${INDENT}Server checks skipped (server cert missing or unreadable)"
+  fi
+
+  if $do_cli_checks; then
+    local client_ku client_eku client_bc client_pka client_sig cli_left
+    client_ku="$(_cert_field "${_EXPORT_DIR}/client.crt" "Key Usage")"
+    client_eku="$(_cert_field "${_EXPORT_DIR}/client.crt" "Extended Key Usage")"
+    client_bc="$(_cert_field "${_EXPORT_DIR}/client.crt" "Basic Constraints")"
+    client_pka="$(_pubkey_alg_of "${_EXPORT_DIR}/client.crt" | tr '[:upper:]' '[:lower:]')"
+    client_sig="$(_sigalg_of "${_EXPORT_DIR}/client.crt" | tr '[:upper:]' '[:lower:]')"
+
+    echo -n "${INDENT}"
+    [[ "$client_eku" =~ [Cc]lient ]] && ok "Client EKU includes clientAuth" || err "Client EKU missing clientAuth"
+
+    echo -n "${INDENT}"
+    if [[ "$client_ku" =~ [Dd]igital[[:space:]]*Signature ]]; then
+      ok "Client KU includes Digital Signature"
+    else
+      warn "Client KU missing Digital Signature"
+    fi
+
+    echo -n "${INDENT}"
+    [[ "$client_bc" =~ CA:TRUE ]] && warn "Client cert has CA:TRUE (unusual)" || ok "Client leaf is not a CA"
+
+    echo -n "${INDENT}"
+    if [[ "$client_pka" == *ed25519* || "$client_sig" == *ed25519* ]]; then
+      err "Client uses Ed25519 (Shelly does NOT support Ed25519 signatures)"
+    fi
+
+    echo -n "${INDENT}"
+    cli_left="$(_days_left "${_EXPORT_DIR}/client.crt")"
+    if [[ -n "$cli_left" ]]; then
+      (( cli_left < 30 )) && warn "Client certificate expires in $cli_left days" || ok "Client certificate $cli_left days left"
+    fi
+  else
+    echo "${INDENT}Client checks skipped (client cert missing or unreadable)"
+  fi
+
+  # ---- Restore strict mode ---------------------------------------------
+  set -o pipefail
+  trap 'err "Failed at line $LINENO: $BASH_COMMAND"; exit 1' ERR
+  set -e
+
+  ok "TLS diagnostics done."
+  # ---------- end TLS summary diagnostics ----------
+}
+
 # ---------- Final output formatting helpers ----------
 COL1_W=36
 COL2_W=50
@@ -909,65 +1202,9 @@ echo
 # Friendly tip to avoid confusion hitting MQTT port in a browser
 warn "Port 8883 is MQTT over TLS (not HTTP). Use a MQTT client; If you expose files via HTTP, (never ${TLS_DIR})."
 
-# ---------- TLS quick diagnostics (non-fatal) ----------
-section "TLS quick diagnostics (non-fatal)"
-
-# Make sure failures here don't abort the script
-set +e
-
-TLS_DIR="${TLS_DIR:-/etc/rabbitmq-tls}"
-HOST_SHOW="${CONNECT_HOST:-${SERVER_IP}}"
-
-printf "%sLocal server certificate (CN/SAN/Issuer/Fingerprint)%s\n" "$PURPLE$BOLD" "$NC"
-sudo openssl x509 -in "$TLS_DIR/tls.crt" -noout \
-  -subject -issuer -dates -fingerprint -sha256 \
-  -ext subjectAltName 2>/dev/null | sed 's/^/  /'
-echo
-
-printf "%sCA certificate (basic constraints / key usage)%s\n" "$PURPLE$BOLD" "$NC"
-sudo openssl x509 -in "$TLS_DIR/ca.crt" -noout -text 2>/dev/null \
-  | grep -Ei 'Basic Constraints|Key Usage|CA:TRUE|keyCertSign|cRLSign' | sed 's/^/  /'
-echo
-
-printf "%sLocal chain verification%s\n" "$PURPLE$BOLD" "$NC"
-sudo openssl verify -CAfile "$TLS_DIR/ca.crt" "$TLS_DIR/tls.crt" 2>&1 | sed 's/^/  /'
-echo
-
-# Fingerprint compare: local vs what the broker presents on the wire (mTLS-aware)
-printf "%sRemote certificate at %s:8883 (best-effort)%s\n" "$PURPLE$BOLD" "$HOST_SHOW" "$NC"
-
-# Temporarily relax error handling for best-effort network probe
-trap - ERR
-set +o pipefail
-
-REMOTE_OUT="$(
-  timeout 6 openssl s_client -connect "${HOST_SHOW}:8883" -servername "${CONNECT_DNS:-$HOST_SHOW}" \
-    -CAfile "$TLS_DIR/ca.crt" \
-    -cert   "${EXPORT_DIR}/client.crt" \
-    -key    "${EXPORT_DIR}/client.key" \
-    -tls1_2 </dev/null 2>/dev/null
-)"
-REMOTE_FPR="$(printf '%s' "$REMOTE_OUT" | openssl x509 -noout -fingerprint -sha256 2>/dev/null | awk -F= '{print $2}')"
-
-if [[ -n "$REMOTE_FPR" ]]; then
-  LOCAL_FPR="$(sudo openssl x509 -in "$TLS_DIR/tls.crt" -noout -fingerprint -sha256 2>/dev/null | awk -F= '{print $2}')"
-  printf "  Local  SHA256 Fingerprint: %s\n" "${LOCAL_FPR:-<unknown>}"
-  printf "  Remote SHA256 Fingerprint: %s\n" "${REMOTE_FPR}"
-  if [[ -n "$LOCAL_FPR" && "$LOCAL_FPR" == "$REMOTE_FPR" ]]; then
-    printf "%s  ✔ Fingerprints MATCH (no TLS terminator in the middle)%s\n" "$GREEN" "$NC"
-  else
-    printf "%s  ✖ Fingerprints DIFFER (LB/proxy or wrong cert being presented)%s\n" "$RED" "$NC"
-  fi
-  printf '%s' "$REMOTE_OUT" | openssl x509 -noout -subject -issuer -ext subjectAltName 2>/dev/null | sed 's/^/  /'
-else
-  printf "  (Could not retrieve remote certificate — port closed, firewall, or handshake blocked)\n"
+# ---- Run TLS diagnostics only if requested ----
+if [[ "${DEBUG_TLS}" == "1" ]]; then
+  tls_summary_diagnostics
 fi
-echo
-
-# Restore strict mode
-set -o pipefail
-trap 'err "Failed at line $LINENO: $BASH_COMMAND"; exit 1' ERR
-
-set -e
-# ---------- end TLS quick diagnostics ----------
+# ---------- end TLS summary diagnostics ----------
 ok "Done."
